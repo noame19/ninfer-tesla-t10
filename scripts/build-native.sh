@@ -26,7 +26,7 @@ tests="${NINFER_TESTS:-ON}"
 multicall="${NINFER_MULTICALL:-OFF}"
 jobs="${NINFER_JOBS:-$(nproc)}"
 
-case "$arch" in 80|86|89|120a) ;; *) printf 'NINFER_CUDA_ARCH must be 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
+case "$arch" in 75|80|86|89|120a) ;; *) printf 'NINFER_CUDA_ARCH must be 75, 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
 case "$tests" in ON|OFF) ;; *) printf 'NINFER_TESTS must be ON or OFF, got %s\n' "$tests" >&2; exit 2 ;; esac
 case "$multicall" in ON|OFF) ;; *) printf 'NINFER_MULTICALL must be ON or OFF, got %s\n' "$multicall" >&2; exit 2 ;; esac
 

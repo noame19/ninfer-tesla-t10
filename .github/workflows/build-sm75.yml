@@ -1,0 +1,84 @@
+# Builds the Turing (sm_75) port for the NVIDIA Tesla T10 (TU102, 16 GB).
+#
+# GitHub-hosted runners have no GPU, but nvcc only needs to *compile* for sm_75, so the whole
+# product builds here. The binaries are uploaded for the maintainer to download and run on the T10.
+#
+# The build runs inside NVIDIA's CUDA devel image so nothing is installed on the runner host beyond
+# Docker. CUDA 13's minimum supported architecture is sm_75 (Turing), which is exactly the target.
+name: build-sm75
+
+on:
+  push:
+    branches: [sm75, 'sm75/**']
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: CMAKE_CUDA_ARCHITECTURES to build
+        required: false
+        default: '75'
+
+concurrency:
+  group: build-sm75-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-sm75:
+    name: CUDA build (sm_75, no GPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      # The runner's disk holds the toolchain image, a build tree and the object files; log the
+      # free space so a disk failure is visible.
+      - name: Disk before
+        run: df -h /
+
+      - uses: actions/checkout@v5
+
+      - name: Build sm_75
+        env:
+          ARCH: ${{ github.event.inputs.arch || '75' }}
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e NINFER_CUDA_ARCH="$ARCH" -e NINFER_BUILD_DIR=/src/build-sm75 \
+            -e NINFER_TESTS=OFF -e NINFER_MULTICALL=ON -e NINFER_JOBS=4 \
+            nvidia/cuda:13.4.2-devel-ubuntu24.04 bash -c '
+              set -eux
+              apt-get update
+              apt-get install --yes --no-install-recommends \
+                cmake ninja-build pkg-config git file rsync \
+                libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+                libcurl4-openssl-dev zlib1g-dev python3 python3-jinja2
+              cc="$(command -v gcc-13 || command -v gcc)"
+              cxx="$(command -v g++-13 || command -v g++)"
+              export CC="$cc" CXX="$cxx" CUDAHOSTCXX="$cxx"
+              scripts/build-native.sh configure
+              scripts/build-native.sh build
+            ' 2>&1 | tee build-sm75.log
+
+      - name: Stage binaries
+        if: always()
+        run: |
+          mkdir -p dist
+          for f in ninfer ninfer-serve ninfer-perplexity ninfer-calibrate ninfer-multicall; do
+            if [ -e "build-sm75/apps/$f" ]; then cp -a "build-sm75/apps/$f" dist/; fi
+          done
+          ls -la dist || true
+
+      - name: Upload binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-sm75
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-sm75-log
+          path: build-sm75.log
+          if-no-files-found: warn
+          retention-days: 14
