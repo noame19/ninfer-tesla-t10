@@ -45,8 +45,10 @@ __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsign
 //     {a0=(r0..7,k0..7), a1=(r8..15,k0..7), a2=(r0..7,k8..15), a3=(r8..15,k8..15)}, and an
 //     m16n8k8 takes (rows0..7, rows8..15) as its A, so (a0,a1) and (a2,a3) are the two steps with
 //     B halves b0 and b1. bf16 has no Turing MMA at all, so it is converted to f16 per element
-//     first (the represented values are exact in f16's range for the weights and activations this
-//     tree feeds it).
+//     first. f16 holds fewer exponent bits than bf16, so a magnitude above 65504 rounds to
+//     infinity; one infinity in an operand reaches the accumulator as inf or, through inf*0, as
+//     NaN. The conversion saturates instead, as cvt.rn.satfinite.f16x2.f32 does on Ampere and
+//     later, so an out-of-range value costs its distance to 65504 rather than the whole tile.
 //
 //   * m16n8k32 (s8) = four m8n8k16. The A fragment holds {a0=(r0..7,k0..15), a1=(r8..15,k0..15),
 //     a2=(r0..7,k16..31), a3=(r8..15,k16..31)} and B {b0=(k0..15), b1=(k16..31)}, and the 8-row
@@ -54,9 +56,18 @@ __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsign
 //     takes one row half, one k half and its C pair.
 //
 // ldmatrix (m8n8.x1/x2/x4) exists on Turing, so fragment assembly is unchanged.
+//
+// NaN (which rounds to NaN, not to infinity) is preserved.
+__device__ __forceinline__ __half bf16_to_f16_saturated(float value) {
+    const __half rounded = __float2half_rn(value);
+    if (__hisinf(rounded)) { return __float2half_rn(value > 0.0f ? 65504.0f : -65504.0f); }
+    return rounded;
+}
+
 __device__ __forceinline__ unsigned bf162_to_f162(unsigned b) {
-    const auto* bf = reinterpret_cast<const __nv_bfloat162*>(&b);
-    const half2 h  = __float22half2_rn(__bfloat1622float2(*bf));
+    const auto* bf  = reinterpret_cast<const __nv_bfloat162*>(&b);
+    const float2 f  = __bfloat1622float2(*bf);
+    const __half2 h = __halves2half2(bf16_to_f16_saturated(f.x), bf16_to_f16_saturated(f.y));
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
