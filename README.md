@@ -9,6 +9,39 @@ NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NIn
 carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
 The [documentation map](docs/README.md) lists the guides and references.
 
+## Tesla T10 (Turing sm_75) port
+
+This fork adds an `sm_75` target so the engine runs on an **NVIDIA Tesla T10** (TU102, 16 GB,
+compute capability 7.5), keeping the GGUF block-format support this line carries so a mixed
+`gguf_q4_k` / `gguf_iq3_s` / `gguf_iq4_xs` / … artifact loads unchanged.
+
+Turing is the oldest device the Ampere/Ada compatibility path serves, and it is missing two things
+that path assumed:
+
+* **No `cp.async`** (added in Ampere). `src/ops/common/memory.cuh` falls back to synchronous
+  register-staged copies with `cp_commit`/`cp_wait` as no-ops; every staging loop already ends in a
+  `__syncthreads()`, which is what publishes the data.
+* **No `m16n8k16`/`m16n8k32` tensor-core shapes.** Turing's f16 and int8 MMA shapes are `m16n8k8`
+  and `m8n8k16`. `src/ops/common/mma.cuh` emulates `m16n8k16` (f16 and f16-accumulate) as two
+  `m16n8k8`, `m16n8k32` (s8) as four `m8n8k16`, and tf32 `m16n8k8` by gathering its more widely
+  distributed operands onto the f16 unit. `ldmatrix` exists on Turing, so fragment assembly is
+  unchanged.
+
+`CMakeLists.txt` admits `75`, runs the `NINFER_SM8X_COMPAT` path for it and defines `NINFER_SM75`.
+FP8 A8 and NVFP4 W4A4 stay stubbed as they are for `sm_86`. CUDA 13 still supports `sm_75`, so the
+build uses the same toolkit as the other targets.
+
+Build (the artifacts are produced by `.github/workflows/build-sm75.yml` on GPU-less runners):
+
+```bash
+cmake -S . -B build-sm75 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=75 -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF
+cmake --build build-sm75 -j
+```
+
+An `sm_75` build runs only on Turing (Tesla T10, RTX 2080 Ti, …); the Ampere/Ada builds do not run
+on it, and it does not run on `sm_86`.
+
 ## Highlights
 
 ### Ternary Bonsai 2 27B and Qwen3.8-27B

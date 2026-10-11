@@ -32,6 +32,23 @@ static_assert(kSamplerPartialTileItems == (1 << kSamplingTileIndexBits));
 using SamplingTileWarpSort     = cub::WarpMergeSort<unsigned long long, kSamplerItemsPerThread>;
 using SamplingBf16TileWarpSort = cub::WarpMergeSort<unsigned int, kSamplerItemsPerThread>;
 
+// __reduce_max_sync lowers to redux.sync, an Ampere (sm_80) instruction Turing does not have. The
+// mask at every call site is the leading kSamplingTileWarps lanes of one warp, so a shuffle
+// butterfly over exactly those lanes (offsets from group-width/2 down to 1, which is always a power
+// of two) computes the same reduction.
+__device__ __forceinline__ unsigned int sampling_max_sync(unsigned int mask, unsigned int value) {
+#if defined(NINFER_SM75)
+    const int width = __popc(mask);
+    for (int offset = width >> 1; offset > 0; offset >>= 1) {
+        const unsigned int other = __shfl_xor_sync(mask, value, offset);
+        value                    = value > other ? value : other;
+    }
+    return value;
+#else
+    return __reduce_max_sync(mask, value);
+#endif
+}
+
 struct SamplingTileTopKStorage {
     typename SamplingTileWarpSort::TempStorage warp[kSamplingTileWarps];
     unsigned long long candidates[kSamplingTileWarps * kSamplerCandidateCap];
@@ -193,9 +210,9 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
             const unsigned long long key =
                 storage.candidates[lane * kSamplerCandidateCap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int max_high = sampling_max_sync(kMergeMask, high);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int max_low  = sampling_max_sync(kMergeMask, low);
             const unsigned int winners =
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
@@ -232,7 +249,7 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
             const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int best    = sampling_max_sync(kMergeMask, key);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {
