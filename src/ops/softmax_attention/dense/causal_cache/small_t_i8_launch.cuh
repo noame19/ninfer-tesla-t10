@@ -159,7 +159,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             } else if (routed == "12x1x32") {
                 launch.template operator()<12, 1, 32, false>();
             } else if (routed == "12x1x64d") {
+#if defined(NINFER_SM75)
+                // The 64-key dynamic arena is 4*64*256 = 65,536 bytes, the whole of Turing's
+                // shared memory per SM; take the 32-key route instead.
+                taken = false;
+#else
                 launch.template operator()<12, 1, 64, true>();
+#endif
             } else if (routed == "24x1x32") {
                 launch.template operator()<24, 1, 32, false>();
             } else if (routed == "6x2x32q") {
@@ -191,7 +197,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         } else if (implementation_window <= 2054) {
             launch.template operator()<12, 1, 32, false>();
         } else if (implementation_window <= 8198) {
+#if defined(NINFER_SM75)
+            // The 64-key arena needs 65,536 bytes of dynamic shared memory -- all of Turing's
+            // shared memory per SM -- so use the 32-key route (2*KeyBlock*HeadDim = 32 KiB).
+            launch.template operator()<12, 1, 32, false>();
+#else
             launch.template operator()<12, 1, 64, true>();
+#endif
         } else {
             launch.template operator()<6, 2, 32, false>();
         }

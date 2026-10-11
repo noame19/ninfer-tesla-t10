@@ -61,7 +61,7 @@ jobs:
           set -o pipefail
           docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
             -e NINFER_CUDA_ARCH="$ARCH" -e NINFER_BUILD_DIR=/src/build-sm75 \
-            -e NINFER_TESTS=OFF -e NINFER_MULTICALL=ON -e NINFER_JOBS=4 \
+            -e NINFER_TESTS=OFF -e NINFER_MULTICALL=OFF -e NINFER_JOBS=4 \
             -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=6G -e CCACHE_COMPILERCHECK=content \
             -e DEBIAN_FRONTEND=noninteractive \
             debian:12 bash -c '
@@ -94,9 +94,10 @@ jobs:
               cmake --version
               ccache --zero-stats
               # -k 0 keeps going so one run surfaces every compile error, not just the first.
-              # ninfer-multicall is the whole product in one executable under NINFER_MULTICALL.
+              # Only the API server is built: every program links the same ~850 MB kernel image, and
+              # ninfer-serve is the only one this deployment uses.
               scripts/build-native.sh configure
-              cmake --build "$NINFER_BUILD_DIR" --target ninfer-multicall \
+              cmake --build "$NINFER_BUILD_DIR" --target ninfer-serve \
                 --parallel "$NINFER_JOBS" -- -k 0
               ccache --show-stats
             ' 2>&1 | tee build-sm75.log
@@ -108,12 +109,12 @@ jobs:
             echo "## sm_75 build"
             echo '```'
             grep -E "error:|fatal error:|FAILED:" build-sm75.log | sort -u | head -200 || true
-            if [ -e build-sm75/apps/ninfer-multicall ]; then
+            if [ -e build-sm75/apps/ninfer-serve ]; then
               echo "--- highest GLIBC/GLIBCXX required ---"
-              objdump -T build-sm75/apps/ninfer-multicall 2>/dev/null \
+              objdump -T build-sm75/apps/ninfer-serve 2>/dev/null \
                 | grep -oE "GLIBC_[0-9.]+|GLIBCXX_[0-9.]+" | sort -Vu | tail -6 || true
               echo "--- NEEDED ---"
-              objdump -p build-sm75/apps/ninfer-multicall 2>/dev/null | grep NEEDED || true
+              objdump -p build-sm75/apps/ninfer-serve 2>/dev/null | grep NEEDED || true
             fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -129,11 +130,8 @@ jobs:
         if: always()
         run: |
           mkdir -p dist
-          # ninfer-multicall is the only real file; the other names are symlinks to it and the
-          # artifact uploader would dereference them into five copies. Ship the one real file and
-          # let the downloader recreate the links.
-          if [ -e build-sm75/apps/ninfer-multicall ]; then
-            cp -a build-sm75/apps/ninfer-multicall dist/
+          if [ -e build-sm75/apps/ninfer-serve ]; then
+            cp -a build-sm75/apps/ninfer-serve dist/
           fi
           ls -la dist || true
 
