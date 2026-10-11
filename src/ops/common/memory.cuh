@@ -3,6 +3,8 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
 enum class Cache { ca, cg };

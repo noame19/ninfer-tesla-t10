@@ -53,8 +53,19 @@ jobs:
               cxx="$(command -v g++-13 || command -v g++)"
               export CC="$cc" CXX="$cxx" CUDAHOSTCXX="$cxx"
               scripts/build-native.sh configure
-              scripts/build-native.sh build
+              # Keep going so one run surfaces every compile error, not just the first.
+              cmake --build "$NINFER_BUILD_DIR" --parallel "$NINFER_JOBS" -- -k 0
             ' 2>&1 | tee build-sm75.log
+
+      - name: Summarize compile errors
+        if: always()
+        run: |
+          echo "## sm_75 build errors" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "error:|Error|FAILED" build-sm75.log | sort -u | head -200 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "error:" build-sm75.log | sort -u | head -100 || true
+
 
       - name: Stage binaries
         if: always()
