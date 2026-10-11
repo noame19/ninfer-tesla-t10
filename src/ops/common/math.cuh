@@ -70,11 +70,18 @@ __device__ __forceinline__ __nv_bfloat16 residual_add_bf16(float accumulator,
 }
 
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
+#if defined(NINFER_SM75)
+    // cvt.rn.bf16x2.f32 is an sm_80 instruction. The header's pair conversion falls back to two
+    // scalar roundings on Turing, which produce the same two bf16 values in the same halves.
+    const __nv_bfloat162 pair = __floats2bfloat162_rn(lo, hi);
+    return load_vec<std::uint32_t>(&pair);
+#else
     std::uint32_t out;
     const std::uint32_t lo_bits = __float_as_uint(lo);
     const std::uint32_t hi_bits = __float_as_uint(hi);
     asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
     return out;
+#endif
 }
 
 // Exact BF16 expansion for consumers that need FP32 operand bits, including TF32 MMA.

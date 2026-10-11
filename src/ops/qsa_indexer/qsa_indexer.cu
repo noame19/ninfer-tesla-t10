@@ -135,6 +135,10 @@ __global__ void __launch_bounds__(kThreads)
 // Four queries (sixteen heads) share each key tile. FP32 operands remain public; TF32 high
 // and residual components are private. Three products omit low*low; qualification checks
 // the resulting selection against the FP64 oracle without reducing stored pooled-key precision.
+//
+// nvcuda::wmma's TF32 fragments (m16n16k8) need sm_80, so Turing builds omit this kernel and
+// qsa_indexer_select takes the FP32 SIMT kernel at every width instead (see below).
+#if !defined(NINFER_SM75)
 __global__ void __launch_bounds__(128)
     qsa_mma_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
                         const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
@@ -199,6 +203,7 @@ __global__ void __launch_bounds__(128)
         }
     }
 }
+#endif // !NINFER_SM75
 
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
 // order), as orderable keys. A query that sees at most 512 blocks needs none.
@@ -432,6 +437,15 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     const dim3 score_grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
                           static_cast<unsigned>(tokens));
     if (capacity > kTopBlocks) {
+#if defined(NINFER_SM75)
+        // The TF32 wmma score kernel needs sm_80; Turing scores every width with the FP32 SIMT
+        // kernel, whose keys are the same orderable values (the extra queries workspace the
+        // capacity function reserves stays unused, which is safe).
+        qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(projection.data), first,
+            static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+            static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity);
+#else
         if (tokens < kMmaTokens) {
             qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
@@ -448,6 +462,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 static_cast<const float*>(queries.data), first, static_cast<const float*>(pooled.data),
                 static_cast<unsigned*>(keys.data), tokens, capacity);
         }
+#endif
         CUDA_CHECK(cudaGetLastError());
     }
     qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
