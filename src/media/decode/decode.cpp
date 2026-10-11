@@ -401,9 +401,21 @@ int rotation_of(const AVStream* stream) {
     if (tag != nullptr) {
         rotation = static_cast<int>(std::nearbyint(std::strtod(tag->value, nullptr)));
     }
-    const AVPacketSideData* side =
-        av_packet_side_data_get(stream->codecpar->coded_side_data,
-                                stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+    const AVPacketSideData* side = nullptr;
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    // FFmpeg 6.0's lookup over an array of coded side data.
+    side = av_packet_side_data_get(stream->codecpar->coded_side_data,
+                                   stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+#else
+    // FFmpeg 5.1 has the coded_side_data array but not that lookup; scan it here. FFmpeg 4.x has
+    // neither the array nor this branch.
+    for (int i = 0; i < stream->codecpar->nb_coded_side_data; ++i) {
+        if (stream->codecpar->coded_side_data[i].type == AV_PKT_DATA_DISPLAYMATRIX) {
+            side = &stream->codecpar->coded_side_data[i];
+            break;
+        }
+    }
+#endif
     if (side != nullptr && side->size >= 9 * sizeof(std::int32_t)) {
         rotation = static_cast<int>(std::nearbyint(
             -av_display_rotation_get(reinterpret_cast<const std::int32_t*>(side->data))));

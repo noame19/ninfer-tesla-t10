@@ -271,7 +271,16 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+#if defined(NINFER_SM75)
+            // Turing has 64 KiB of shared memory per SM and a BN128 CTA stages 40 KiB, so only one
+            // CTA is resident per SM -- not the two these split-K routes are budgeted for. A
+            // cooperative launch sized from a two-CTA budget would not fit, and the launch fails
+            // rather than falling back. Take the unsplit route, which has no grid-wide barrier and
+            // needs no cooperative launch.
+            return false;
+#else
             return cooperative_27_grid_is_resident(schedule, problem.cols, sm_count);
+#endif
         case Bf16GdnGatingScheduleId::MmaUnsplit:
             return true;
         case Bf16GdnGatingScheduleId::SimtWarpRowC4:
@@ -294,7 +303,16 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+#if defined(NINFER_SM75)
+        // Same 64-KiB-per-SM limit as the 27B geometry above (BN64 needs 24 KiB per CTA and the
+        // routes budget three or four CTAs per SM): take the unsplit route on Turing.
+        (void)schedule;
+        (void)problem;
+        (void)sm_count;
+        return false;
+#else
         return cooperative_35_grid_is_resident(schedule, problem.cols, sm_count);
+#endif
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return false;
@@ -542,10 +560,17 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     if (is_27(problem) && problem.cols <= 42)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
     if (is_35(problem) && problem.cols <= 16) {
+#if defined(NINFER_SM75)
+        // This fused route is the cooperative split-32 gating, whose launch cannot fit Turing's
+        // 64 KiB of shared memory per SM. Fall through to the composed route over the unsplit
+        // control plan the resolver above already selected.
+        (void)norm_splits;
+#else
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
+#endif
     }
     const std::size_t norm_partial_bytes =
         static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);

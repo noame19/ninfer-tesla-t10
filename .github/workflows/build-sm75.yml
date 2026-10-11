@@ -1,13 +1,15 @@
 # Builds the Turing (sm_75) port for the NVIDIA Tesla T10 (TU102, 16 GB).
 #
 # GitHub-hosted runners have no GPU, but nvcc only needs to *compile* for sm_75, so the whole
-# product builds here. The binaries are uploaded for the maintainer to download and run on the T10.
+# product builds here; the binaries are uploaded for the maintainer to download and run on the T10.
 #
-# The build runs inside NVIDIA's CUDA devel image so nothing is installed on the runner host beyond
-# Docker. CUDA 13's minimum supported architecture is sm_75 (Turing), which is exactly the target.
+# The build runs on a **Debian 12** base, deliberately. The T10 host is Debian 12 (glibc 2.36,
+# GCC 12 -> GLIBCXX_3.4.30, FFmpeg 5.1), and a binary must not require anything newer than the
+# machine it will run on. CUDA 13.4 comes from NVIDIA's Debian 12 apt repository; the CUDA runtime
+# libraries it links (libcudart.so.13, libcublas.so.13) are supplied on the host at run time.
 #
-# ccache is carried between runs (keyed by commit, restored from the newest matching cache) so an
-# iteration that touches a few translation units recompiles only those instead of the whole tree.
+# ccache is carried between runs so an iteration that touches a few translation units recompiles
+# only those instead of the whole tree.
 name: build-sm75
 
 on:
@@ -22,7 +24,7 @@ on:
       cache_suffix:
         description: Bump to force a fresh ccache namespace
         required: false
-        default: 'v1'
+        default: 'v2'
 
 concurrency:
   group: build-sm75-${{ github.ref }}
@@ -30,7 +32,7 @@ concurrency:
 
 jobs:
   cuda-sm75:
-    name: CUDA build (sm_75, no GPU)
+    name: CUDA build (sm_75, no GPU, Debian 12 base)
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
@@ -48,11 +50,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-sm75-${{ github.event.inputs.cache_suffix || 'v1' }}-${{ github.sha }}
+          key: ccache-sm75-${{ github.event.inputs.cache_suffix || 'v2' }}-${{ github.sha }}
           restore-keys: |
-            ccache-sm75-${{ github.event.inputs.cache_suffix || 'v1' }}-
+            ccache-sm75-${{ github.event.inputs.cache_suffix || 'v2' }}-
 
-      - name: Build sm_75
+      - name: Build sm_75 on Debian 12
         env:
           ARCH: ${{ github.event.inputs.arch || '75' }}
         run: |
@@ -61,46 +63,78 @@ jobs:
             -e NINFER_CUDA_ARCH="$ARCH" -e NINFER_BUILD_DIR=/src/build-sm75 \
             -e NINFER_TESTS=OFF -e NINFER_MULTICALL=ON -e NINFER_JOBS=4 \
             -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=6G -e CCACHE_COMPILERCHECK=content \
-            nvidia/cuda:13.4.2-devel-ubuntu24.04 bash -c '
+            -e DEBIAN_FRONTEND=noninteractive \
+            debian:12 bash -c '
               set -eux
               apt-get update
               apt-get install --yes --no-install-recommends \
-                ccache cmake ninja-build pkg-config git file rsync \
+                ca-certificates curl gnupg ccache ninja-build pkg-config git file rsync \
+                gcc-12 g++-12 \
                 libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
                 libcurl4-openssl-dev zlib1g-dev python3 python3-jinja2
-              cc="$(command -v gcc-13 || command -v gcc)"
-              cxx="$(command -v g++-13 || command -v g++)"
-              export CC="$cc" CXX="$cxx" CUDAHOSTCXX="$cxx"
+
+              # CMake: Debian 12 ships 3.25 and the tree needs 3.28. Take the upstream static build.
+              curl -fsSLo /tmp/cmake.tgz \
+                https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz
+              tar -xzf /tmp/cmake.tgz -C /opt
+              export PATH=/opt/cmake-3.31.6-linux-x86_64/bin:$PATH
+
+              # CUDA 13.4 from NVIDIA Debian 12 repository: the CUDA 13 branch is what ships the
+              # libcudart.so.13 / libcublas.so.13 the maintainer host already has.
+              curl -fsSLo /tmp/cuda-keyring.deb \
+                https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+              dpkg -i /tmp/cuda-keyring.deb
+              apt-get update
+              apt-get install --yes --no-install-recommends cuda-toolkit-13-4
+              export PATH=/usr/local/cuda/bin:$PATH
+              export CUDACXX=/usr/local/cuda/bin/nvcc
+
+              export CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12 CUDAHOSTCXX=/usr/bin/g++-12
+              nvcc --version
+              cmake --version
               ccache --zero-stats
               # -k 0 keeps going so one run surfaces every compile error, not just the first.
+              # ninfer-multicall is the whole product in one executable under NINFER_MULTICALL.
               scripts/build-native.sh configure
-              cmake --build "$NINFER_BUILD_DIR" --parallel "$NINFER_JOBS" -- -k 0
+              cmake --build "$NINFER_BUILD_DIR" --target ninfer-multicall \
+                --parallel "$NINFER_JOBS" -- -k 0
               ccache --show-stats
             ' 2>&1 | tee build-sm75.log
 
-      - name: Summarize compile errors
+      - name: Report what the binary needs
         if: always()
         run: |
-          echo "## sm_75 build errors" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "error:|fatal error:|FAILED:" build-sm75.log | sort -u | head -300 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "error:|fatal error:" build-sm75.log | sort -u | head -120 || true
+          {
+            echo "## sm_75 build"
+            echo '```'
+            grep -E "error:|fatal error:|FAILED:" build-sm75.log | sort -u | head -200 || true
+            if [ -e build-sm75/apps/ninfer-multicall ]; then
+              echo "--- highest GLIBC/GLIBCXX required ---"
+              objdump -T build-sm75/apps/ninfer-multicall 2>/dev/null \
+                | grep -oE "GLIBC_[0-9.]+|GLIBCXX_[0-9.]+" | sort -Vu | tail -6 || true
+              echo "--- NEEDED ---"
+              objdump -p build-sm75/apps/ninfer-multicall 2>/dev/null | grep NEEDED || true
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
-          key: ccache-sm75-${{ github.event.inputs.cache_suffix || 'v1' }}-${{ github.sha }}
+          key: ccache-sm75-${{ github.event.inputs.cache_suffix || 'v2' }}-${{ github.sha }}
 
       - name: Stage binaries
         if: always()
         run: |
           mkdir -p dist
-          for f in ninfer ninfer-serve ninfer-perplexity ninfer-calibrate ninfer-multicall; do
-            if [ -e "build-sm75/apps/$f" ]; then cp -a "build-sm75/apps/$f" dist/; fi
-          done
+          # ninfer-multicall is the only real file; the other names are symlinks to it and the
+          # artifact uploader would dereference them into five copies. Ship the one real file and
+          # let the downloader recreate the links.
+          if [ -e build-sm75/apps/ninfer-multicall ]; then
+            cp -a build-sm75/apps/ninfer-multicall dist/
+          fi
           ls -la dist || true
 
       - name: Upload binaries
