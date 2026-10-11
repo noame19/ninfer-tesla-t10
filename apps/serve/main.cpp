@@ -373,7 +373,12 @@ int main(int argc, char** argv) {
         if (!options.router()) {
             try {
                 first = make_service(options);
-            } catch (const std::exception&) { return 1; }
+            } catch (const std::exception& exception) {
+                // Report the cause: the startup observer above names only the phase that failed,
+                // and swallowing the message here left a startup failure with no explanation.
+                operational_log.server_failure(false, exception.what());
+                return 1;
+            }
             definitions.push_back(
                 ninfer::serve::ModelDefinition{.id = ninfer::serve::resolve_public_model_id(
                                                    options, first->load_summary().model_name),
