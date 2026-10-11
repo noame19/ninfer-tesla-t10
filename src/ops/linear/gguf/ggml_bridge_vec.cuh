@@ -13,6 +13,8 @@
 #include "../../common/fixed_point.cuh"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 
 namespace ninfer::ops::gguf::detail {
@@ -25,6 +27,41 @@ inline constexpr bool kVecStaticK =
     type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
 
 inline constexpr int kVecWarps = 4;
+
+// Development controls for the vector kernel's Turing tuning. They are read once per process and
+// every default is the behaviour the tree shipped with, so a build without the environment set
+// measures exactly what it did before.
+//
+//   NINFER_GGUF_VEC_DIAG=1         print one line per instantiation: the kernel's registers and
+//                                  static shared memory, the occupancy the launcher queries, and
+//                                  the block count it launches.
+//   NINFER_GGUF_VEC_BLOCKS_MULT=F  multiply the launched block count by F (1 = the launcher's own
+//                                  choice). A value above 1 asks whether the kernel is limited by
+//                                  resident blocks or by something inside them.
+//   NINFER_GGUF_VEC_PREFETCH=1     prefetch the next slice's weight bytes into L2 ahead of the
+//                                  decode that reads them, asking whether the loop is exposed to
+//                                  weight-load latency.
+struct VecSweep {
+    bool diag        = false;
+    bool prefetch    = false;
+    int  blocks_mult = 1;
+};
+
+inline const VecSweep& vec_sweep() {
+    static const VecSweep values = [] {
+        const auto read = [](const char* name) -> const char* {
+            const char* value = std::getenv(name);
+            return value == nullptr || *value == '\0' ? nullptr : value;
+        };
+        VecSweep out;
+        out.diag       = read("NINFER_GGUF_VEC_DIAG") != nullptr;
+        out.prefetch   = read("NINFER_GGUF_VEC_PREFETCH") != nullptr;
+        const char* mult = read("NINFER_GGUF_VEC_BLOCKS_MULT");
+        out.blocks_mult  = mult == nullptr ? 1 : std::max(std::atoi(mult), 1);
+        return out;
+    }();
+    return values;
+}
 
 namespace vec {
 
@@ -614,7 +651,7 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
 template <ggml_type type, int T, bool Fused, int KS>
-__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
+__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p, int prefetch) {
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
@@ -651,6 +688,18 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
 #pragma unroll
             for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
         }
+        // The next slice's weight bytes, asked for one iteration before the decode that reads them.
+        // A decode's global loads are consumed immediately by its byte assembly, so without this the
+        // loop pays the full latency of each slice's first load with nothing else to issue.
+        const auto prefetch_slice = [&](int it) {
+            if (prefetch == 0 || lane + 32 * it >= slices) { return; }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const std::uint8_t* next =
+                    rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(next));
+            }
+        };
         const auto slice = [&](int it) {
             const int s = lane + 32 * it;
             int a[T][8];
@@ -676,9 +725,9 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
         if constexpr (KS != 0) {
             static_assert(KS % 1024 == 0);
 #pragma unroll
-            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            for (int it = 0; it < KS / 1024; ++it) { prefetch_slice(it + 1); slice(it); }
         } else {
-            for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
+            for (int it = 0; lane + 32 * it < slices; ++it) { prefetch_slice(it + 1); slice(it); }
         }
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
@@ -707,8 +756,35 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     }
 }
 
+// cudaFuncGetAttributes and the occupancy query are the only way to see the two numbers that decide
+// whether this kernel is where it should be: how many blocks an SM holds, and whether the grid even
+// offers that many.
+template <class KernelType>
+inline void vec_report(KernelType kernel, int format, int block_bytes, int threads, int rows, int k,
+                       int groups, int resident, int blocks, int sm_count) {
+    cudaFuncAttributes attributes{};
+    cudaFuncGetAttributes(&attributes, kernel);
+    std::printf("[gguf-vec] type=%-3d block=%-4dB regs=%3d smem=%5zuB threads=%3d | resident=%d "
+                "sm=%-3d rows=%-6d k=%-6d groups=%-8d blocks=%d\n",
+                format, block_bytes, attributes.numRegs, attributes.sharedSizeBytes, threads,
+                resident, sm_count, rows, k, groups, blocks);
+    std::fflush(stdout);
+}
+
+// One line per instantiation: what the launcher chose, and what the kernel costs to hold resident.
+template <ggml_type type, int T, bool Fused, int KS>
+inline void vec_report_once(int rows, int k, int groups, int resident, int blocks, int sm_count) {
+    static const bool once = [&] {
+        vec_report(kernel<type, T, Fused, KS>, static_cast<int>(type), Decoder<type>::kBlockBytes,
+                   kVecWarps * 32, rows, k, groups, resident, blocks, sm_count);
+        return true;
+    }();
+    (void)once;
+}
+
 template <ggml_type type, int T, bool Fused, int KS>
 void launch(const VecArgs& args, cudaStream_t stream) {
+    const VecSweep& sweep = vec_sweep();
     static const int resident = [] {
         int blocks = 0;
         check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel<type, T, Fused, KS>,
@@ -718,8 +794,15 @@ void launch(const VecArgs& args, cudaStream_t stream) {
     }();
     const int per_block = kVecWarps * (Fused ? 1 : 2);
     const int groups    = (args.rows + per_block - 1) / per_block;
-    const int blocks    = std::min(groups, resident * device_facts().sm_count);
-    kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args);
+    const int resident_blocks = resident * device_facts().sm_count;
+    const int chosen    = std::min(groups, resident_blocks);
+    const int blocks    = chosen * sweep.blocks_mult;
+    if (sweep.diag) {
+        vec_report_once<type, T, Fused, KS>(args.rows, KS != 0 ? KS : args.k, groups, resident,
+                                            chosen, device_facts().sm_count);
+    }
+    kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args,
+                                                                     sweep.prefetch ? 1 : 0);
     check(cudaGetLastError(), "vector product launch");
 }
 
