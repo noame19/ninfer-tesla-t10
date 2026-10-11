@@ -488,6 +488,20 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         }
     }
     if (!profile) {
+#if defined(NINFER_SM75)
+        // Calibration times every route family by running it, and on sm_75 the two families whose
+        // schedules assume 100 KiB of shared memory per SM are replaced by the compiled routes
+        // instead (see the sm_75 branches in causal_softmax_attention.cpp and gdn_gating_proj), so
+        // those launches cannot be measured here. An unprofiled T10 -- which is every T10, since no
+        // sm_75 profile ships and calibration cannot run -- keeps the compiled table, exactly as
+        // --device-profile off does.
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "sm_75 has no calibrated route profile and cannot be calibrated; using "
+                           "the compiled routes for %s (%d SMs)",
+                           hardware_class.c_str(), multiprocessors);
+        ops::install_device_route_profile(device, nullptr);
+        return;
+#else
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "calibrating routes for %s (%d SMs)", hardware_class.c_str(),
                            multiprocessors);
@@ -511,6 +525,7 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         // the compiled table's routes.
         const auto compiled = compiled_device_route_profile(hardware_class, multiprocessors);
         profile = compiled ? layer_device_route_profiles(entry.profile, *compiled) : entry.profile;
+#endif
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "device profile %s: %zu routed keys (%s)", hardware_class.c_str(),

@@ -1038,12 +1038,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     // 12.0 is admitted alongside the qualified capabilities: consumer Blackwell runs the same
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
-    // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
-    // supported here in the sense of running correctly, not of being tuned for.
-    if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
-        device.compute_capability() != 89 && device.compute_capability() != 120) {
+    // memory per SM. 7.5 (Turing) runs them too -- its m16n8k8/m8n8k16 tensor cores and its
+    // emulations of m16n8k16/m16n8k32 in ops/common/mma.cuh produce the same results -- but it has
+    // only 64 KiB of shared memory per SM, so the prompt-attention and GDN split-K routes that
+    // assume 100 KiB are replaced (see the sm_75 branches in causal_softmax_attention.cpp and
+    // gdn_gating_proj). The occupancy and split-k choices remain the sm_86 ones, so these cards run
+    // correctly rather than tuned.
+    if (device.compute_capability() != 75 && device.compute_capability() != 80 &&
+        device.compute_capability() != 86 && device.compute_capability() != 89 &&
+        device.compute_capability() != 120) {
         throw std::invalid_argument(
-            "Qwen3.5 family runtime requires compute capability 8.0, 8.6, 8.9 or 12.0");
+            "Qwen3.5 family runtime requires compute capability 7.5, 8.0, 8.6, 8.9 or 12.0");
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
