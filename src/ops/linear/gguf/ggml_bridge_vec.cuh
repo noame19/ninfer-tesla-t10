@@ -76,19 +76,6 @@ __device__ __forceinline__ std::uint32_t u32_a2(const std::uint8_t* p) {
     return std::uint32_t(h[0]) | (std::uint32_t(h[1]) << 16);
 }
 
-// The same four bytes as u32_a2, in one load. Every IQ layout places its fields on two-byte
-// boundaries, so a 32-bit load from one is not naturally aligned; the hardware splits such an
-// access inside the load unit, and the bytes land in the same little-endian order. It exists here
-// because the decoder's load instructions are what limit this kernel: the vector loop issues eight
-// per 32-value slice and moves only about 55 bytes per instruction, against the 512 bytes the
-// bandwidth probe moves with one. Three of those eight fields are four contiguous bytes, so they
-// need one load each, not two.
-__device__ __forceinline__ std::uint32_t u32_wide(const std::uint8_t* p) {
-    std::uint32_t value;
-    asm volatile("ld.global.b32 %0, [%1];" : "=r"(value) : "l"(p));
-    return value;
-}
-
 __device__ __forceinline__ std::uint32_t u32_a4(const std::uint8_t* p) {
     return *reinterpret_cast<const std::uint32_t*>(p);
 }
@@ -591,10 +578,10 @@ struct Decoder<GGML_TYPE_IQ3_S> {
     __device__ static const std::uint32_t* table() { return iq3s_grid; }
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
-        const std::uint32_t q0 = u32_wide(b + 2 + 8 * u);
-        const std::uint32_t q1 = u32_wide(b + 6 + 8 * u);
+        const std::uint32_t q0 = u32_a2(b + 2 + 8 * u);
+        const std::uint32_t q1 = u32_a2(b + 6 + 8 * u);
         const std::uint32_t qh = b[66 + u];
-        const std::uint32_t sg = u32_wide(b + 74 + 4 * u);
+        const std::uint32_t sg = u32_a2(b + 74 + 4 * u);
         const int sc           = (b[106 + u / 2] >> (4 * (u & 1))) & 0xF;
         s.f[0]                 = half_at(b) * float(1 + 2 * sc);
 #pragma unroll
