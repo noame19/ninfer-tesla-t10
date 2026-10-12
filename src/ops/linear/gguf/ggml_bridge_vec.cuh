@@ -28,36 +28,19 @@ inline constexpr bool kVecStaticK =
 
 inline constexpr int kVecWarps = 4;
 
-// Development controls for the vector kernel's Turing tuning. They are read once per process and
-// every default is the behaviour the tree shipped with, so a build without the environment set
-// measures exactly what it did before.
-//
-//   NINFER_GGUF_VEC_DIAG=1         print one line per instantiation: the kernel's registers and
-//                                  static shared memory, the occupancy the launcher queries, and
-//                                  the block count it launches.
-//   NINFER_GGUF_VEC_BLOCKS_MULT=F  multiply the launched block count by F (1 = the launcher's own
-//                                  choice). A value above 1 asks whether the kernel is limited by
-//                                  resident blocks or by something inside them.
-//   NINFER_GGUF_VEC_PREFETCH=1     prefetch the next slice's weight bytes into L2 ahead of the
-//                                  decode that reads them, asking whether the loop is exposed to
-//                                  weight-load latency.
+// NINFER_GGUF_VEC_DIAG=1 prints, once per instantiation, the vector kernel's registers, static
+// shared memory, the occupancy the launcher queries, and the block count it launches: the numbers
+// that say whether this kernel's grid already offers every block an SM can hold. It changes no
+// launch argument, so a build without it measures the product exactly.
 struct VecSweep {
-    bool diag        = false;
-    bool prefetch    = false;
-    int  blocks_mult = 1;
+    bool diag = false;
 };
 
 inline const VecSweep& vec_sweep() {
     static const VecSweep values = [] {
-        const auto read = [](const char* name) -> const char* {
-            const char* value = std::getenv(name);
-            return value == nullptr || *value == '\0' ? nullptr : value;
-        };
+        const char* value = std::getenv("NINFER_GGUF_VEC_DIAG");
         VecSweep out;
-        out.diag       = read("NINFER_GGUF_VEC_DIAG") != nullptr;
-        out.prefetch   = read("NINFER_GGUF_VEC_PREFETCH") != nullptr;
-        const char* mult = read("NINFER_GGUF_VEC_BLOCKS_MULT");
-        out.blocks_mult  = mult == nullptr ? 1 : std::max(std::atoi(mult), 1);
+        out.diag = value != nullptr && *value != '\0';
         return out;
     }();
     return values;
@@ -651,7 +634,7 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
 template <ggml_type type, int T, bool Fused, int KS>
-__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p, int prefetch) {
+__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
@@ -688,18 +671,6 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p, int prefetch
 #pragma unroll
             for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
         }
-        // The next slice's weight bytes, asked for one iteration before the decode that reads them.
-        // A decode's global loads are consumed immediately by its byte assembly, so without this the
-        // loop pays the full latency of each slice's first load with nothing else to issue.
-        const auto prefetch_slice = [&](int it) {
-            if (prefetch == 0 || lane + 32 * it >= slices) { return; }
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                const std::uint8_t* next =
-                    rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
-                asm volatile("prefetch.global.L2 [%0];" ::"l"(next));
-            }
-        };
         const auto slice = [&](int it) {
             const int s = lane + 32 * it;
             int a[T][8];
@@ -725,9 +696,9 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p, int prefetch
         if constexpr (KS != 0) {
             static_assert(KS % 1024 == 0);
 #pragma unroll
-            for (int it = 0; it < KS / 1024; ++it) { prefetch_slice(it + 1); slice(it); }
+            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
         } else {
-            for (int it = 0; lane + 32 * it < slices; ++it) { prefetch_slice(it + 1); slice(it); }
+            for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
         }
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
@@ -784,7 +755,6 @@ inline void vec_report_once(int rows, int k, int groups, int resident, int block
 
 template <ggml_type type, int T, bool Fused, int KS>
 void launch(const VecArgs& args, cudaStream_t stream) {
-    const VecSweep& sweep = vec_sweep();
     static const int resident = [] {
         int blocks = 0;
         check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel<type, T, Fused, KS>,
@@ -794,15 +764,12 @@ void launch(const VecArgs& args, cudaStream_t stream) {
     }();
     const int per_block = kVecWarps * (Fused ? 1 : 2);
     const int groups    = (args.rows + per_block - 1) / per_block;
-    const int resident_blocks = resident * device_facts().sm_count;
-    const int chosen    = std::min(groups, resident_blocks);
-    const int blocks    = chosen * sweep.blocks_mult;
-    if (sweep.diag) {
+    const int blocks    = std::min(groups, resident * device_facts().sm_count);
+    if (vec_sweep().diag) {
         vec_report_once<type, T, Fused, KS>(args.rows, KS != 0 ? KS : args.k, groups, resident,
-                                            chosen, device_facts().sm_count);
+                                            blocks, device_facts().sm_count);
     }
-    kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args,
-                                                                     sweep.prefetch ? 1 : 0);
+    kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args);
     check(cudaGetLastError(), "vector product launch");
 }
 
