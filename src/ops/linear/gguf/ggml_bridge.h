@@ -5,6 +5,7 @@
 // everything here is raw pointers and cudaStream_t.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -118,6 +119,28 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
                          const __nv_bfloat16* x, int columns, float* out,
                          std::int64_t out_column_stride, void* scratch, std::size_t scratch_bytes,
                          cudaStream_t stream);
+
+// The FP16 form of the same product. Turing has no native BF16 GEMM: cuBLAS measures about
+// 4.5 TFLOP/s on this card in BF16 and about 43 TFLOP/s in FP16 with an FP32 accumulator, so FP16
+// is the usable cuBLAS route on sm_75. `x` is the FP16 activation [k, columns], which
+// convert_bf16_to_f16 produces. cuBLAS requires both operands in one format, which is why the
+// activation is converted rather than mixed.
+void dequantized_product_f16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
+                             int k, const __half* x, int columns, float* out,
+                             std::int64_t out_column_stride, void* scratch,
+                             std::size_t scratch_bytes, cudaStream_t stream);
+
+// Converts the contiguous BF16 [k, columns] activation `x` to FP16 in `out` (same layout).
+void convert_bf16_to_f16(const __nv_bfloat16* x, int k, int columns, __half* out,
+                         cudaStream_t stream);
+
+// The FP16 destination of the row dequantization dequantized_product_f16 feeds.
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __half* out,
+                     std::int64_t out_row_stride, cudaStream_t stream);
+
+// Rows per pass of dequantized_product_f16 for a scratch of `scratch_bytes`.
+[[nodiscard]] int dequantized_rows_per_pass_f16(int k, std::size_t scratch_bytes);
 
 // --- Mixture of experts -------------------------------------------------------------------------
 // A product over the experts a router selected: pair p (token p / per_token, its slot p %
