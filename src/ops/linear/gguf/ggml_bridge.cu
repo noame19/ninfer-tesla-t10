@@ -948,8 +948,8 @@ void convert_bf16_to_f16(const __nv_bfloat16* x, int k, int columns, __half* out
     const std::int64_t count = std::int64_t(k) * columns;
     if (count <= 0) { return; }
     constexpr int kThreads = 256;
-    convert_bf16_to_f16_kernel<<<static_cast<unsigned>((count + kThreads - 1) / kThreads), kThreads, 0,
-                                 stream>>>(x, out, count);
+    detail::convert_bf16_to_f16_kernel<<<static_cast<unsigned>((count + kThreads - 1) / kThreads),
+                                         kThreads, 0, stream>>>(x, out, count);
     CUDA_CHECK(cudaGetLastError());
 }
 
