@@ -69,6 +69,10 @@ struct VecArgs {
     const std::int8_t* qs; // [columns][k]
     const half2* ds;       // [columns][k / 32]
     VecStore out;
+    // 1: the kernel stages the weight bytes it is about to decode into shared memory with aligned
+    // 16-byte loads (the launcher passes the matching dynamic shared memory). 0: every lane loads
+    // its own fields straight from global memory. Both produce bit-identical products.
+    int staged;
 };
 
 // The vector kernel's MoE form (ggml_bridge_vec.cuh moe_kernel).
