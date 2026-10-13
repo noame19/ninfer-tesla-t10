@@ -950,7 +950,7 @@ void convert_bf16_to_f16(const __nv_bfloat16* x, int k, int columns, __half* out
     constexpr int kThreads = 256;
     detail::convert_bf16_to_f16_kernel<<<static_cast<unsigned>((count + kThreads - 1) / kThreads),
                                          kThreads, 0, stream>>>(x, out, count);
-    CUDA_CHECK(cudaGetLastError());
+    detail::check(cudaGetLastError(), "bf16 to f16 conversion launch");
 }
 
 void dequantized_product_f16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
