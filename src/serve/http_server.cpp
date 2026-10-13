@@ -4,6 +4,7 @@
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
+#include "serve/kvmem_status_json.h"
 #include "serve/mcp_proxy.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
@@ -1031,7 +1032,7 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"frequency_penalty", overrides.frequency_penalty.value_or(preset.frequency_penalty)},
     };
     params["seed"] = overrides.seed ? nlohmann::json(*overrides.seed) : nlohmann::json(-1);
-    const nlohmann::json props = {
+    nlohmann::json props = {
         {"default_generation_settings",
          {{"n_ctx", facts.capacity.max_context},
           {"speculative", options.speculative.backend != ninfer::SpeculativeBackend::None},
@@ -1047,6 +1048,36 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         // The WebUI ungreys its "Use llama-server proxy" option from this flag alone.
         {"cors_proxy_enabled", options_.webui_mcp_proxy},
     };
+    props["backend"] = "ninfer";
+    const auto& execution = service.engine_options();
+    props["execution"] = {{"mode", execution.devices.size() > 1 ? "layer" : "single"},
+        {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},
+        {"stage_layers", execution.stage_layers}};
+    props["kvmem"] = {{"enabled", options.kvmem.selected_tokens != 0},
+        {"selected_tokens", options.kvmem.selected_tokens},
+        {"reserve_tokens", options.kvmem.reserve_tokens},
+        {"sink_tokens", options.kvmem.sink_tokens},
+        {"recent_tokens", options.kvmem.recent_tokens},
+        {"host_payload_budget_bytes", options.kvmem.host_bytes}};
+    if (options.kvmem.selected_tokens) {
+        props["kvmem"]["usage"] = kvmem_status_json(service.runtime_stats().kvmem);
+        props["kvmem"]["capabilities"] = {{"text_chat", true}, {"streaming", true},
+            {"history_reuse", options.allow_prefix_reuse}, {"original_positions", true},
+            {"disk_restore", false},
+            {"active_kv_tiering", true},
+            {"ssd_enabled", options.kvmem.disk_bytes != 0},
+            {"ssd_persistence", "process"},
+            {"speculative_decoding", options.speculative.backend == SpeculativeBackend::Mtp},
+            {"mtp_drafts", options.speculative.draft_tokens}, {"multimodal", options.enable_vision},
+            {"ngram_drafts", options.speculative.ngram_draft_tokens},
+            {"ngram_min_match", options.speculative.ngram_min_match},
+            {"max_active_requests", options.max_concurrency},
+            {"retained_sessions", options.kvmem.retained_sessions},
+            {"multi_gpu_mode", execution.devices.size() > 1 ? "layer" : "single"},
+            {"shared_host_history", true},
+            {"disk_budget_bytes", options.kvmem.disk_bytes},
+            {"cross_backend_kv_transfer", false}};
+    }
     res.set_content(props.dump(), "application/json");
 }
 

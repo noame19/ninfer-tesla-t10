@@ -313,14 +313,34 @@ asking for raw JSON without Markdown fences and retaining tools for information 
 This helps the model choose the intended final-answer branch when tools remain enabled; the
 token grammar enforces validity independently. Tool selection and termination remain model
 decisions under `tool_choice:"auto"`; use `tool_choice:"none"` when no further tools are needed.
-Requests without an explicit response format receive no format instruction or grammar.
+Requests without an explicit response format receive no JSON format instruction or JSON body grammar.
 
-The native tool envelope restricts calls to declared names and emits each declared parameter at most
-once, in the declaration order shown in the prompt. Parameter values remain non-strict; delimiter spellings that would make
-Qwen XML ambiguous are excluded. Strict tool argument generation and arbitrary grammar/regex aliases
-remain unsupported. Custom stops and assistant-prefill continuation are rejected with structured
-output. Public C++ callers select `ExecutionOptions::structured_output` and use default stops and
-decoded text output.
+Tool requests use constrained decoding by default, independently of `--structured-output`.
+`tool_constraints:"basic"` restricts native Qwen calls to declared/allowed tool names and complete
+terminal call sequences. Non-strict parameter values retain best-effort normalization.
+`tool_constraints:"auto"` opts out of this automatic basic grammar only when the request has no
+strict tools, required/named/allowed selection, or parallel-call restriction.
+
+`strict:true` enforces the supported JSON Schema subset for tool arguments. Its root must resolve
+to one `type:"object"` with `additionalProperties:false`. Required fields, nested JSON objects and
+arrays, enums, raw string patterns/lengths, and numeric bounds are constrained during sampling.
+Top-level parameters mixing string and non-string types are rejected because Qwen renders strings
+as raw text and other values as JSON. The pinned compiler rejects unsupported assertions instead
+of weakening them; this includes `uniqueItems` in strict tool arguments, inexact numeric schema
+literals, and general schema intersections. Singleton root `allOf` and local root references are
+supported. Final JSON responses retain the existing unique-string validator.
+
+OpenAI `required` supports multiple declarations; a named OpenAI choice produces exactly one call.
+Anthropic `any` requires at least one call, and a named Anthropic choice allows repeated calls to
+that tool unless parallel use is disabled. `none` blocks tool calls. Allowed selections and `none`
+retain the original prompt declarations and their order so KV reuse is independent of selection.
+Thinking remains available with required/named choices. With a JSON response format, `auto` permits
+either the JSON final body or tool calls; `required` permits calls, and `none` permits the JSON body.
+
+Active constraints require default EOS stops and decoded output. Assistant continuation must be
+a legal grammar prefix. Cancellation and truncation publish only completed tool calls; partial
+calls are discarded without repair or a synthetic error-tool call. Public C++ callers use
+`RequestOptions::tool_choice`; JSON formats also use `ExecutionOptions::structured_output`.
 
 Only normal completed final-content responses guarantee a complete JSON document satisfying the supported
 schema. Token/context limits, cancellation, transport failure, or generation errors can leave a
@@ -749,7 +769,11 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
+  `video_url` extension using HTTP(S) or data URIs; image `detail` may be omitted, null,
+  `auto`, `low`, `high`, or `original`. All recognized levels use the same fixed `auto`
+  preprocessing and startup `--vision-max-merged` budget; explicit levels are compatibility
+  hints, not separate resolution or token-budget guarantees. Unknown strings and non-string
+  values other than null are rejected;
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
   both apply the [default output limit](#default-output-limit);
@@ -776,11 +800,10 @@ The endpoint supports:
 - function tools and free-form `custom` tools, the latter served to the model as a
   single-string-input function under the caller's own tool name so callers that dispatch by name
   keep working;
-- `tool_choice` `auto`, `none`, a named function, `required` over a single callable tool, or
-  `allowed_tools` in either mode, which force that call; a `custom` selection is accepted as
-  advisory narrowing;
-- `strict:true` as an advisory flag, since decoding is not constrained to the schema, and
-  `parallel_tool_calls:false`, honored by keeping the first call;
+- `tool_choice` `auto`, `none`, named functions/custom tools, `required` across one or more
+  callable tools, and `allowed_tools`; selections are enforced during generation;
+- `strict:true` for the supported tool-argument schemas, and `parallel_tool_calls:false` enforced
+  by sampling at most one call;
 - assistant tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
@@ -793,8 +816,8 @@ The endpoint supports:
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output on a server without `--structured-output` (unless
 it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
-output, `required` tool choice over several callable tools, explicit low/high image detail, web
-search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+output, web search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy
+`functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 The vLLM/llama.cpp constrained-decoding extensions (`grammar`, `structured_outputs`, `guided_json`,
 `guided_regex`, `guided_choice`, and `guided_grammar`) are rejected explicitly instead of being
@@ -1249,15 +1272,15 @@ wire response contains typed `output` Items.
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` requests disabled thinking; other standard effort values pass to the selected template |
-| `reasoning.summary`, `reasoning.generate_summary` | `auto`, `concise` or `detailed` (other values are rejected, and the two must agree when both are sent); a value requests the same fixed protocol placeholder summary without changing model execution, and is echoed in the response. `reasoning.context` and `reasoning.mode` are rejected with `reasoning_option_not_supported` |
+| `reasoning.summary`, `reasoning.generate_summary` | `auto`, `concise` or `detailed` (other values are rejected, and the two must agree when both are sent); accepted and echoed without changing model execution. Summaries are not generated: reasoning Items retain `summary: []` and complete raw `reasoning_text`. `reasoning.context` and `reasoning.mode` are rejected with `reasoning_option_not_supported` |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
 | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
-| `tool_choice` | `auto`, `none`, a named function, `required` over a single callable tool, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
-| `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
+| `tool_choice` | `auto`, `none`, a named function, `required` over one or more callable tools, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
+| `parallel_tool_calls` | `true` by default; `false` constrains generation to at most one tool call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | integer in `[0,20]`; a nonzero value also asks for [token log probabilities](#token-log-probabilities) |
@@ -1283,7 +1306,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, null, `auto`, `low`, `high`, or `original`; all recognized levels fall back to fixed `auto` preprocessing; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -1308,7 +1331,12 @@ An `input_text`, `input_image`, or tool-result part may carry
 boundaries; they affect reuse opportunities, not prompt identity or output semantics. String
 message status/phase metadata is accepted but has no Qwen prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
+Image detail levels do not select separate preprocessing profiles: the server's startup
+`--vision-max-merged` budget applies to every recognized level, and canonical image Items stored
+for response-chain replay use `detail:"auto"`. Unknown strings and non-string values other than
+null remain HTTP 400 errors.
+
+`input_file`, `input_audio`, image `file_id`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -1352,36 +1380,22 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` filters that set without changing
+undeclared names are blocked during constrained decoding. `allowed_tools` filters that set without changing
 declaration order, while `tool_choice:"none"` disables structured tool output even when the history
 contains earlier calls.
 
-A forced selection names one function: `tool_choice` naming it directly, `required`, or
-`allowed_tools` with mode `required` over a single callable tool. NInfer executes it by ending the
-generation prompt with that call's opener, so the answer can only continue inside the call. It
-therefore requires a fresh answer position and a prompt without a thinking block: reasoning that
-the request itself enables is rejected with `tool_choice_not_supported`, while reasoning that only a
-default turns on, the server's or the chat template's, is switched off for that request. `required`
-over several callable tools is rejected too, because the function itself would still be sampled. The forced call is present and first in the output; a model that keeps writing may
-add further calls, exactly as under `auto` with parallel calls enabled.
-
-NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, hosted tools, remote MCP tools, and custom free-form tools are rejected. Deferred
-loading, output schemas, and caller restrictions that exclude direct invocation are also rejected
-because their semantics cannot be honored.
-
-NInfer does not execute functions or constrain tool arguments with JSON Schema, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
-tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
+Required, named and allowed tool selections use the common [tool constraints](#structured-output)
+contract, retain declarations in the prompt, and support thinking. `strict:true` enforces supported
+tool-argument schemas. Hosted tools, remote MCP tools, custom Responses free-form tools, deferred
+loading, output schemas and caller restrictions excluding direct invocation remain unsupported.
 
 ### Response object and usage
 
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
 `cancelled` in `status`, and a typed `output` array. NInfer may emit:
 
-- a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
-  `reasoning.summary` is requested;
+- a `reasoning` item containing complete raw `reasoning_text` and an empty `summary` array,
+  including when `reasoning.summary` is requested;
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
 
@@ -1432,13 +1446,11 @@ The normal lifecycle is:
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
-For a reasoning Item requested with any string-valued `reasoning.summary`, its
-`response.output_item.added` and `.done` payloads carry the same placeholder summary. Immediately
-after the Item is added, the stream emits `response.reasoning_summary_part.added`,
-`response.reasoning_summary_text.delta`, `response.reasoning_summary_text.done`, and
-`response.reasoning_summary_part.done` with `summary_index:0`, then continues with the raw
-`reasoning_text` content lifecycle. Omitted or `null` summary requests emit none of these summary
-events and retain an empty Item `summary` array.
+Reasoning Items carry `summary: []` in `response.output_item.added`, `.done`, and the terminal
+Response, regardless of the requested summary style. The stream emits the raw `reasoning_text`
+content lifecycle and no `response.reasoning_summary_*` events. Unsupported summaries must not
+be replaced with explanatory placeholder text: clients that prefer a non-empty summary over raw
+content would otherwise lose the full reasoning body used for display and context accounting.
 
 For `include:["reasoning.encrypted_content"]`, the in-progress
 `response.output_item.added` Item omits `encrypted_content` because the complete reasoning text is
@@ -1511,8 +1523,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, `include` values other than
 `reasoning.encrypted_content`, background execution, compaction, files/audio, and
-OpenAI-hosted/MCP/custom tools. Except for the two explicitly documented placeholders,
-these are compatibility boundaries rather than silently accepted approximations.
+OpenAI-hosted/MCP/custom tools. Documented accepted hints and the local raw-reasoning mirror
+are exceptions; other unsupported capabilities remain explicit compatibility boundaries.
 
 
 ## Anthropic Messages
@@ -1576,16 +1588,11 @@ protocol-validated value to the selected template, substituting the nearest valu
 accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`,
 enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
 
-User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
-`input_examples`. `tool_choice` `auto`, `none`, `tool` naming a declared tool, and `any` over a
-single callable tool are executable; the last two require reasoning to be disabled for the request.
-`any` over several tools is advisory: NInfer cannot make the model pick one of them, so the tools
-stay offered under automatic selection (Qwen Code sends `any` for its JSON side queries such as
-its permission classifier, session title and next-speaker check); `any` without tools is rejected.
-`disable_parallel_tool_use:true` is honoured as `parallel_tool_calls:false` is on the OpenAI
-endpoints: the response keeps the first tool call and drops the rest. `strict:true`, deferred
-tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets, MCP, and
-containers are rejected because their required constraint or executor is absent. `tool_result` preserves text/image order and marks
+User-defined tools support `name`, `description`, object `input_schema`, `strict` and
+`input_examples`. `auto`, `none`, a named `tool`, and `any` use the common constrained selection
+rules described above; `any` without tools is rejected. `disable_parallel_tool_use:true` constrains
+generation to one call. Deferred tools, tools excluding direct model calls, Anthropic-provided
+server tools, toolsets, MCP and containers remain unsupported. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
@@ -1733,7 +1740,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
+| `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile (KVMem defaults off and admits INT8/RK profiles only) |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | off |
@@ -1764,8 +1771,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head | off |
 | `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts, the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
-| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
+| `--lookup-ngram N` | legacy context-lookup drafting alongside `--spec`; disabled with KVMem, which uses `--ngram-draft-tokens` and `--ngram-min-match` | `0` (off) |
+| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; widths 16..63 automatically reduce to 15 at startup with `--max-concurrency > 1`, with a warning) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |
 | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |

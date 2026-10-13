@@ -307,6 +307,8 @@ Contract::Tool compile_tool_contract(const Json& definition) {
     const auto name = function->find("name");
     if (name == function->end() || !name->is_string()) { return contract; }
     contract.name = name->get<std::string>();
+    contract.strict = function->value("strict", false);
+    contract.schema_json = function->value("parameters", Json{{"type", "object"}}).dump();
 
     const auto schema = function->find("parameters");
     if (schema == function->end() || !schema->is_object()) { return contract; }
@@ -348,6 +350,7 @@ void append_tool_contract(Contract& contracts, const Json& definition) {
         contracts.tools.push_back(std::move(compiled));
         return;
     }
+    contracts.duplicate_names = true;
     if (existing->unambiguous && !same_contract(*existing, compiled)) {
         existing->parameters.clear();
         existing->unambiguous = false;
@@ -909,7 +912,10 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
     contract->tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
-        if (!definition.is_discarded()) { append_tool_contract(*contract, definition); }
+        if (!definition.is_discarded()) {
+            append_tool_contract(*contract, definition);
+            if (!contract->tools.empty()) contract->tools.back().declaration_index = contract->tools.size() - 1;
+        }
     }
     return contract;
 }
@@ -1021,6 +1027,10 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
                                              std::size_t max_tool_name_length)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length) {
+    if (contract_ && contract_->constrained && !contract_->continuation.empty()) {
+        (void)feed(contract_->continuation);
+        return;
+    }
     if (contract_ == nullptr || contract_->forced_tool_name.empty()) { return; }
     const std::string& forced_tool_name = contract_->forced_tool_name;
     // The generation prompt ends with exactly this opener, so generation resumes inside the call
@@ -1085,6 +1095,74 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     finished_ = true;
     if (!contract_) { return {}; }
 
+    if (contract_->constrained) {
+        Terminal out;
+        std::string_view region = tool_region_;
+        std::size_t cursor = 0;
+        while (cursor < region.size()) {
+            const auto begin = region.find("<tool_call>\n<function=", cursor);
+            if (begin == std::string_view::npos) break;
+            if (out.tool_calls.empty()) out.content = std::string(region.substr(cursor, begin - cursor));
+            auto pos = begin + std::string_view("<tool_call>\n<function=").size();
+            const auto name_end = region.find(">\n", pos);
+            if (name_end == std::string_view::npos) break;
+            const auto name = region.substr(pos, name_end - pos);
+            const auto* tool = find_tool_contract(*contract_, name);
+            if (!tool) break;
+            pos = name_end + 2;
+            Json arguments = Json::object();
+            bool complete = true;
+            while (region.substr(pos).starts_with("<parameter=")) {
+                pos += std::string_view("<parameter=").size();
+                const auto key_end = region.find(">\n", pos);
+                if (key_end == std::string_view::npos) { complete = false; break; }
+                const std::string key(region.substr(pos, key_end - pos));
+                pos = key_end + 2;
+                // JSON arguments may contain delimiter bytes inside a quoted JSON string.
+                const auto* parameter = find_parameter_contract(*tool, key);
+                const bool json_value = parameter && parameter->encoding == Contract::Encoding::Json;
+                bool quoted = false, escaped = false;
+                std::size_t end = pos;
+                for (; end < region.size(); ++end) {
+                    if (!quoted && region.substr(end).starts_with("\n</parameter>\n")) break;
+                    if (!json_value) continue;
+                    const char c = region[end];
+                    if (quoted) {
+                        if (escaped) escaped = false;
+                        else if (c == '\\') escaped = true;
+                        else if (c == '"') quoted = false;
+                    } else if (c == '"') quoted = true;
+                }
+                if (end == region.size()) { complete = false; break; }
+                const auto value = region.substr(pos, end - pos);
+                if (json_value) {
+                    auto parsed = Json::parse(value, nullptr, false);
+                    if (parsed.is_discarded()) { complete = false; break; }
+                    arguments[key] = std::move(parsed);
+                } else if (parameter && parameter->encoding == Contract::Encoding::RawString) {
+                    arguments[key] = std::string(value);
+                } else {
+                    const auto framed = "\n" + std::string(value) + "\n";
+                    auto normalized = normalize_parameter(framed, parameter);
+                    if (normalized.disposition != ParameterNormalization::Omitted)
+                        arguments[key] = Json::parse(normalized.json_value);
+                }
+                pos = end + std::string_view("\n</parameter>\n").size();
+            }
+            constexpr std::string_view close = "</function>\n</tool_call>";
+            if (!complete || !region.substr(pos).starts_with(close)) break;
+            out.tool_calls.push_back({std::string(name), arguments.dump()});
+            cursor = pos + close.size();
+            if (!contract_->parallel) break;
+        }
+        if (!saw_tool_marker_) {
+            out.content = std::move(trailing_whitespace_);
+            out.content += pending_marker_;
+        }
+        tool_region_.clear(); trailing_whitespace_.clear(); pending_marker_.clear();
+        out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
+        return out;
+    }
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
     if (forced_ && parsed.diagnostics.fallback_reason != FallbackReason::None) {

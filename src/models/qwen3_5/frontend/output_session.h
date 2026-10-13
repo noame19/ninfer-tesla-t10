@@ -73,6 +73,8 @@ public:
     // Tokens of the thinking-control suffix which may still be forced through the output budget.
     // Zero once this session can no longer apply one.
     [[nodiscard]] std::uint32_t control_suffix_tokens() const noexcept;
+    // A nonempty prefix of pending_control_tokens(); bounded chunks allow the
+    // engine to yield while preparing the next native KV window.
     [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
                                                           std::uint32_t total_budget_remaining);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);

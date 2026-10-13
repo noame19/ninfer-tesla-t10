@@ -1,10 +1,12 @@
 """A Qwen3.5/3.8 dense GGUF kept in its own ggml block formats (GSQ-RCO mixed-precision releases).
 
-Every text projection, the token table, the output head and the MTP head of an ``-mtp`` build are
-stored as the exporter's own blocks, one ggml type per tensor, so no weight is re-quantised: a row
+The block-quantized main text projections, token table, output head and MTP head of an ``-mtp``
+build are stored as the exporter's own blocks, without re-quantizing these matrices: a row
 of the artifact is byte for byte a row of the GGUF. llama.cpp's Qwen3.5 exporter conventions are
 undone where they touch rows or small tensors: value heads return to the grouped order,
 zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` again.
+The small GDN alpha/beta gates use the runtime's BF16 format; quantized GGUF gates are decoded
+with gguf-py before that cast, while gates already stored in BF16 retain their exact words.
 
 ``ssm_out`` is the exception. Its tiled value heads are its input columns, which a row copy cannot
 move without re-quantising, so its Use carries an ``input_columns`` auxiliary: column ``c`` of the
@@ -157,9 +159,10 @@ def validate(gguf: GGUFFile) -> None:
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
         stored = info.type_id in GGUF_FORMATS_BY_TYPE
-        if info.shape != shape or (kind == "blocks") != stored or (
-            kind != "blocks" and info.type_name != kind
-        ):
+        valid_kind = stored if kind == "blocks" else (
+            info.type_name == kind or (kind == "BF16" and stored)
+        )
+        if info.shape != shape or not valid_kind:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
@@ -203,6 +206,21 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
     return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).reshape(
         last - first, -1
     )
+
+
+def _gate_projection(gguf: GGUFFile, tensor: str) -> LogicalSource:
+    """Read tiled GDN gates into BF16 without changing the encoded main projections."""
+
+    info = gguf.info(tensor)
+    if info.type_name == "BF16":
+        words = untile(gguf.read_bf16_words(tensor), 1)
+        values = torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
+            torch.bfloat16
+        )
+    else:
+        decoded = _dequantize(gguf, tensor, 0, info.shape[0]).numpy()
+        values = torch.from_numpy(np.ascontiguousarray(untile(decoded, 1))).to(torch.bfloat16)
+    return array_source(values, tensor)
 
 
 def block_source(
@@ -315,13 +333,7 @@ def text_sources(
             gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
-            words = untile(gguf.read_bf16_words(g + tensor), 1)
-            direct[n + role] = array_source(
-                torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
-                    torch.bfloat16
-                ),
-                g + tensor,
-            )
+            direct[n + role] = _gate_projection(gguf, g + tensor)
         ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
@@ -340,22 +352,39 @@ def text_sources(
         )
         direct[n + "norm"] = _norm(gguf, g + "ssm_norm.weight", False)
     if mtp:
-        g, p = f"blk.{MTP_BLOCK}.", "mtp/layers/0/"
-        e, d = _layer(gguf, g, p)
-        encoded |= e
-        direct |= d
-        e, d = _attention(gguf, g, p + "attention/")
-        encoded |= e
-        direct |= d
-        encoded["mtp/input_projection"] = block_source(
-            gguf, g + "nextn.eh_proj.weight", (HIDDEN, 2 * HIDDEN), rows()
-        )
-        for role, tensor in (
-            ("embedding_norm", "nextn.enorm.weight"),
-            ("hidden_norm", "nextn.hnorm.weight"),
-            ("final_norm", "nextn.shared_head_norm.weight"),
-        ):
-            direct["mtp/" + role] = _norm(gguf, g + tensor, True)
+        e, d = mtp_sources(gguf)
+        encoded.update(e)
+        direct.update(d)
+    return encoded, direct
+
+
+def mtp_sources(gguf: GGUFFile) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+    """Dense 27B MTP blocks with the exporter's zero-centred (+1 stored) norms.
+
+    This is the same MTP schema used by the dense GGUF recipe. A ternary target
+    may use it independently; its main weights need not be GGUF block formats.
+    """
+    required = {name: value for name, value in expected_tensors(True).items()
+                if name.startswith(f"blk.{MTP_BLOCK}.")}
+    for name, (shape, kind) in required.items():
+        info = gguf.info(name)
+        if info.shape != shape:
+            raise ValueError(f"{name}: MTP shape {info.shape} differs from {shape}")
+        if kind == "blocks":
+            block_format(gguf, name)
+        elif info.type_name not in ("F32", "F16", "BF16"):
+            raise ValueError(f"{name}: MTP norm must be a direct format")
+    g, p = f"blk.{MTP_BLOCK}.", "mtp/layers/0/"
+    encoded, direct = _layer(gguf, g, p)
+    e, d = _attention(gguf, g, p + "attention/")
+    encoded.update(e)
+    direct.update(d)
+    encoded["mtp/input_projection"] = block_source(
+        gguf, g + "nextn.eh_proj.weight", (HIDDEN, 2 * HIDDEN), rows())
+    for role, tensor in (("embedding_norm", "nextn.enorm.weight"),
+                         ("hidden_norm", "nextn.hnorm.weight"),
+                         ("final_norm", "nextn.shared_head_norm.weight")):
+        direct["mtp/" + role] = _norm(gguf, g + tensor, True)
     return encoded, direct
 
 

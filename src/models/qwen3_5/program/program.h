@@ -851,6 +851,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool waiting_for_storage              = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;
@@ -1068,6 +1069,13 @@ public:
     // True while the sequence's next media item is still encoding in a concurrent overlay Vision
     // window; the Engine gives that lane no prefill unit until it completes.
     [[nodiscard]] bool vision_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool memory_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool prepare_decode_memory(SequenceHandle sequence);
+    [[nodiscard]] std::uint32_t memory_control_chunk() const noexcept;
+    [[nodiscard]] bool prepare_control_memory(SequenceHandle sequence, std::uint32_t tokens);
+    [[nodiscard]] bool cancel_memory_ready(SequenceHandle sequence) noexcept;
+    [[nodiscard]] bool memory_maintenance_pending() const noexcept;
+    bool progress_memory_storage();
     // Replaces the sampling of an active sequence from its next round; the grammar mask and the
     // penalty counts carry over.
     void update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling);
@@ -1178,6 +1186,8 @@ public:
     continuation_summary(const ContinuationHandle& continuation) const;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+    // False while active request reservations occupy an auxiliary physical tier.
+    [[nodiscard]] bool temporary_request_feasible(const RequestBasePlan& base) const noexcept;
 
     // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
     // transaction the Engine drives for Legacy materialization: quote, reserve, then

@@ -4735,12 +4735,11 @@ shape the entries described.
       box: `/tmp/ftest/sub/a.cpp` becomes `./sub/a.cpp` and the absolute prefix leaves `strings`
       entirely.
 
-      **MSVC has no working equivalent and that is measured, not assumed.** It takes `__FILE__`
-      from the path as written on the command line and CMake writes absolute ones; the usual
-      suggestion, the undocumented `/d1trimfile:`, had *no effect* on `__FILE__` when tested
-      against 14.44.35207 with an absolute source path. The Windows binaries keep their ~466
-      occurrences. Device-side `__FILE__` from nvcc's own frontend is not covered either -- there
-      is no documented flag for it.
+      **Host MSVC `__FILE__` is trimmed.** `/d1trimfile:` needs the source root plus a trailing
+      separator; without the separator it had no effect on 14.44.35207, which is what the first
+      measurement recorded. With the separator, the same compiler and CUDA 13.2 nvcc rewrite both
+      the host `__FILE__` and the device `__FILE__` string. The MSVC branch of `CMakeLists.txt`
+      now passes it. GCC `-ffile-prefix-map` still does not reach nvcc's device frontend.
 
 - [x] **The shipped `-maxctx` launchers ask for a host-KV pin they cannot have. Closed 2026-09-09 —
       by documenting it, because the behaviour is right and the flag is not.**

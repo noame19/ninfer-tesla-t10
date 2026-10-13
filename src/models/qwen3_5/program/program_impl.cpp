@@ -1,3 +1,4 @@
+#include "kvmem/spill_io.hpp"
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
@@ -7,6 +8,7 @@
 #include "core/host_kv_clamp.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "core/resident_memory.h"
 #include <cuda_runtime.h>
 #include "ninfer/ops/target_logprobs.h"
 
@@ -154,7 +156,9 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
     const StageLinkOptions residual{.slot_bytes   = columns * hidden * sizeof(std::uint16_t),
                                     .slots        = 2,
                                     .force_staged = force_staged};
-    // Six int32 control tensors of at most `columns` entries, plus alignment.
+    // Six int32 control tensors and one KVMem logical-origin scalar, plus alignment. Only the position pair is ever full
+    // width in prefill (cache `columns`, multimodal rope `3 * columns`), so the sum stays inside
+    // `6 * columns`; `run_staged` checks the packed size against this slot regardless.
     const StageLinkOptions control{.slot_bytes   = (6 * columns + 16) * sizeof(std::int32_t),
                                    .slots        = 2,
                                    .force_staged = force_staged};
@@ -229,7 +233,13 @@ std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device,
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
                          DeviceContext& device_in, const StartupObserver& startup_observer)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
-      kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
+      kv_capacity(plan.kv_capacity),
+      kvmem_window_tokens(plan.kvmem_window_tokens),
+      kvmem_options(plan.kvmem),
+      memory_payload_storage(plan.kvmem.host_bytes, plan.kvmem.disk_bytes
+          ? std::make_shared<kvmem::SpillFile>(plan.kvmem.disk_path, plan.kvmem.disk_bytes) : nullptr),
+      memory_retained_budget(plan.kvmem.host_bytes),
+      max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
@@ -281,6 +291,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
+    // The Program destructor does not run if its constructor throws. Synchronize before members
+    // unwind, so queued initialization/Graph work cannot retain pointers to freed arena backing.
+    struct StartupSyncGuard {
+        DeviceContext& device;
+        ~StartupSyncGuard() noexcept {
+            try { device.synchronize(); } catch (...) {}
+        }
+    } startup_sync{device};
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
@@ -444,6 +462,23 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
     }
+    if (kvmem_options.disk_bytes) {
+        const auto page_bytes = text_host_kv_page_stride + backend_host_kv_page_stride;
+        const auto pages = std::uint64_t(kvmem_window_tokens / 64) * max_concurrency;
+        if (!page_bytes || pages > kvmem_options.host_bytes / page_bytes)
+            throw std::invalid_argument("KVMem SSD requires H to hold one native B+R transfer window per lane");
+        const auto headroom = pages * page_bytes;
+        // The working windows reserve space for unpublished destinations. Enabling
+        // a small SSD cannot reduce the history that already fits entirely in H.
+        memory_retained_budget = std::max(kvmem_options.host_bytes,
+            kvmem_options.host_bytes + kvmem_options.disk_bytes - headroom);
+        const auto state_bytes = state_images->host_layout().image_bytes;
+        memory_io = std::make_unique<kvmem::StorageIoQueue>(
+            std::max<std::size_t>(2, 2 * max_concurrency) + 2, 2 * headroom + 2 * state_bytes,
+            std::min<std::size_t>(2, max_concurrency));
+        memory_transfer_storage = kvmem::HostKvStorage(2 * headroom);
+        memory_state_staging = kvmem::HostKvStorage(state_bytes);
+    }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());
     pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
     if (backend_kv_pages) {
@@ -555,6 +590,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    if (!plan.persistent.memory_statistics.empty()) {
+        const auto& config = parameters.model.config().text;
+        memory_statistics.emplace();
+        memory_statistics->key_width = config.attention->key_width();
+        memory_statistics->query_width = config.attention->query_width();
+        memory_statistics->layers = config.full_attention_layers;
+        memory_statistics->columns = (std::min(plan.prefill_chunk, plan.capacity) + 126U) / 64U;
+        memory_statistics->ranks.resize(device.size());
+        memory_candidate_statistics = *memory_statistics;
+        memory_candidate_statistics->columns = (detail::widest_verify_window(plan) + 1U) * plan.max_concurrency;
+        memory_statistics_host = std::make_unique<PinnedHostBuffer>(
+            memory_statistics->key_bytes() + memory_statistics->query_bytes());
+        memory_candidate_host = std::make_unique<PinnedHostBuffer>(
+            memory_candidate_statistics->key_bytes());
+        memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity), 0, 0};
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const auto& layout = plan.persistent.memory_statistics[rank];
+            auto& stats = memory_statistics->ranks[rank];
+            auto& candidates = memory_candidate_statistics->ranks[rank];
+            stats.first_layer = candidates.first_layer = layout.first_layer;
+            candidates.block_tokens = 1;
+            if (!layout.layers) { continue; }
+            stats.key_sums = layout.key_sums.bind(backings[rank]);
+            stats.query_sums = layout.query_sums.bind(backings[rank]);
+            stats.ranges = layout.ranges.bind(backings[rank]);
+            candidates.key_sums = layout.candidate_keys.bind(backings[rank]);
+            candidates.query_sums = stats.query_sums;
+            candidates.ranges = stats.ranges;
+            candidates.candidate_origin = layout.candidate_origin.bind(backings[rank]);
+            DeviceBinding binding(device.rank(rank).device);
+            const auto stream = device.stream_for_rank(rank);
+            CUDA_CHECK(cudaMemcpyAsync(stats.ranges.data, memory_statistics_ranges.data(),
+                sizeof(memory_statistics_ranges), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemsetAsync(candidates.candidate_origin.data, 0,
+                sizeof(std::int32_t), stream));
+        }
+        memory_statistics->ranks.front().prefill_origin =
+            plan.persistent.memory_statistics.front().prefill_origin.bind(backing);
+    }
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
@@ -635,11 +709,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        const auto residency = core::current_resident_memory();
+        std::size_t dedicated_before = 0;
+        if (residency) {
+            residency->check("before Graph preparation");
+            dedicated_before = residency->stats().dedicated_bytes;
+        }
         const std::size_t free_before = device.free_bytes();
         prepare_graphs();
         device.synchronize();
         const std::size_t free_after = device.free_bytes();
         graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        if (residency) {
+            // WDDM clamps CUDA free at zero once the process is over budget. Use
+            // the process's observed dedicated delta so Graph usage does not
+            // falsely become zero precisely when capacity is being stretched.
+            residency->check("after Graph preparation");
+            const auto dedicated_after = residency->stats().dedicated_bytes;
+            graph_measured_bytes = dedicated_after > dedicated_before
+                ? dedicated_after - dedicated_before : 0;
+        }
         graph_phase.complete();
     }
     work.reset();
@@ -856,6 +945,60 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
 
 MemorySummary ProgramImpl::memory_summary() const noexcept {
     MemorySummary out;
+    if (kvmem_window_tokens) {
+        auto& memory = out.kvmem;
+        memory.enabled = true;
+        memory.selected_tokens = kvmem_options.selected_tokens;
+        memory.reserve_tokens = kvmem_options.reserve_tokens;
+        memory.host_payload_budget_bytes = kvmem_options.host_bytes;
+        memory.transfer_staging_bytes = (memory_kv_staging ? memory_kv_staging->size() : 0) +
+            memory_transfer_storage.charged_bytes() + memory_state_staging.charged_bytes();
+        if (memory_idle_transfer && memory_idle_transfer->source.use_count() == 1)
+            memory.transfer_staging_bytes += memory_idle_transfer->source->size();
+        memory.statistics_staging_bytes =
+            (memory_statistics_host ? memory_statistics_host->size() : 0) +
+            (memory_candidate_host ? memory_candidate_host->size() : 0);
+        memory.resident_pages = text_kv_pages->physical_pool().allocated_pages();
+        memory.mtp_resident_pages = backend_kv_pages
+            ? backend_kv_pages->physical_pool().allocated_pages() : 0;
+        memory.history_hits = memory_history_hits;
+        memory.history_misses = memory_history_misses;
+        memory.history_evictions = memory_history_evictions;
+        const auto disk = memory_payload_storage.io_stats();
+        memory.disk_hits = disk.reads;
+        memory.disk_writes = disk.writes;
+        memory.disk_errors = disk.errors;
+        memory.disk_read_bytes = disk.read_bytes;
+        memory.disk_written_bytes = disk.written_bytes;
+        memory.disk_payload_bytes = memory_payload_storage.disk_bytes();
+        memory.disk_payload_budget_bytes = kvmem_options.disk_bytes;
+        memory.retained_payload_budget_bytes = memory_retained_budget;
+        for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_reservation;
+        const auto collect = [&](const KvmemWindowState& window) {
+            // Moves into the history directory leave scalar fields behind until lane
+            // retirement. Ownership of statistics identifies the live history.
+            if (!window.statistics) return;
+            memory.statistics_bytes += window.statistics->allocated_bytes();
+            memory.evaluated_tokens = std::max(memory.evaluated_tokens, window.statistics_frontier);
+            memory.history_swaps += window.swaps;
+            memory.history_spilled_bytes += window.spilled_bytes;
+            memory.history_restored_bytes += window.restored_bytes;
+            for (const auto kind : kKvmemCheckpointKinds) {
+                if (const auto* checkpoint = memory_checkpoint(window, kind)) {
+                    if (checkpoint->state) memory.checkpoint_bytes += checkpoint->state->size();
+                    memory.checkpoint_tokens = std::max(memory.checkpoint_tokens,
+                        static_cast<std::uint32_t>(checkpoint->prefix.size()));
+                }
+            }
+        };
+        for (const auto& sequence : continuation_states) collect(sequence.window);
+        for (const auto& history : memory_histories) {
+            if (!history) continue;
+            ++memory.retained_sessions;
+            collect(*history);
+        }
+        memory.host_payload_bytes = memory_payload_storage.charged_bytes();
+    }
     out.device          = device.device;
     out.max_context     = capacity;
     out.kv_capacity     = kv_capacity;

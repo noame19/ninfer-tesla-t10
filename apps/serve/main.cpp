@@ -275,6 +275,11 @@ int main(int argc, char** argv) {
     }
     ninfer::product::LoggingRuntime logging(logging_options);
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
+    if (options.requested_ngram_draft_tokens) {
+        logger->warn("ngram draft tokens reduced from {} to {} for max concurrency {}",
+                     *options.requested_ngram_draft_tokens, options.speculative.ngram_draft_tokens,
+                     options.max_concurrency);
+    }
     ninfer::product::StartupLogRenderer startup_log(logging);
     ninfer::serve::OperationalLog operational_log(logger);
     // Stop prompts use the transient bottom line beneath the statistics panel; output without one
@@ -339,6 +344,9 @@ int main(int argc, char** argv) {
         // One model's service: its Engine loaded and warmed up. Single-model mode builds it before
         // the registry exists, to learn the model's public id; router mode builds each on demand.
         const auto make_service = [&](const ninfer::serve::ServeOptions& model_options) {
+            if (options.router() && model_options.kvmem.selected_tokens != 0) {
+                throw std::invalid_argument("KVMem is not supported in model router mode");
+            }
             auto service = std::make_unique<ninfer::serve::GenerationService>(
                 model_options, startup_log.observer(),
                 ninfer::product::engine_diagnostic_observer(logger),
@@ -368,7 +376,10 @@ int main(int argc, char** argv) {
         if (!options.router()) {
             try {
                 first = make_service(options);
-            } catch (const std::exception&) { return 1; }
+            } catch (const std::exception& exception) {
+                operational_log.server_failure(false, exception.what());
+                return 1;
+            }
             definitions.push_back(
                 ninfer::serve::ModelDefinition{.id = ninfer::serve::resolve_public_model_id(
                                                    options, first->load_summary().model_name),

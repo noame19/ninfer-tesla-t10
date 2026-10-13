@@ -9,6 +9,7 @@
 #include "ninfer/types.h"
 
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <vector>
@@ -30,6 +31,7 @@ struct DevicePlacement {
     std::size_t rank = 0;
     // Zero bytes reserved right after the object (Binder::device_tail), written by every upload.
     std::uint64_t tail = 0;
+    bool replica = false;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned).
@@ -109,6 +111,7 @@ public:
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
     [[nodiscard]] const WeightParent& device_parent(ObjectHandle handle) const;
+    [[nodiscard]] const WeightParent& device_replica(ObjectHandle handle, std::size_t rank) const;
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
@@ -150,6 +153,8 @@ private:
 
     struct ObjectStorage {
         std::optional<WeightParent> device;
+        std::size_t device_rank = 0;
+        std::map<std::size_t, WeightParent> replicas;
         std::optional<WeightParent> pinned;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;

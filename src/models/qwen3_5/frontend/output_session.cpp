@@ -437,7 +437,8 @@ public:
          std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
-          preserve_special(output.raw || output.preserve_special_tokens),
+          preserve_special(output.raw || output.preserve_special_tokens ||
+                           (tool_call_output_ && tool_call_output_->constrained)),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length) {
@@ -706,7 +707,8 @@ std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept 
     if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
         return {};
     }
-    return *impl_->thinking_control_tokens;
+    return std::span<const TokenId>(*impl_->thinking_control_tokens)
+        .subspan(impl_->semantic.injected_tokens);
 }
 
 std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
@@ -715,7 +717,7 @@ std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
         return 0;
     }
     return impl_->semantic.control_pending || impl_->semantic.in_reasoning
-               ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
+               ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size()) - impl_->semantic.injected_tokens
                : 0U;
 }
 
@@ -725,9 +727,9 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
     const std::span<const TokenId> expected = pending_control_tokens();
-    if (expected.empty() || tokens.size() != expected.size() ||
+    if (tokens.empty() || tokens.size() > expected.size() ||
         !std::equal(tokens.begin(), tokens.end(), expected.begin())) {
-        throw std::invalid_argument("thinking control preview requires the exact pending span");
+        throw std::invalid_argument("thinking control preview requires a prefix of the pending span");
     }
     if (tokens.size() > total_budget_remaining) {
         throw std::invalid_argument("thinking control span exceeds the remaining output budget");
@@ -753,15 +755,16 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
     }
-    if (impl_->preview_semantic.in_reasoning) {
+    const bool complete = tokens.size() == expected.size();
+    if (complete && impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");
     }
-    if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
+    if (complete && impl_->split_reasoning && impl_->preview_state.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
-    impl_->preview_semantic.control_pending = false;
-    impl_->preview_semantic.applied         = true;
-    impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl_->preview_semantic.control_pending = !complete;
+    impl_->preview_semantic.applied         = complete;
+    impl_->preview_semantic.injected_tokens += static_cast<std::uint32_t>(tokens.size());
     if (impl_->grammar) {
         impl_->preview_grammar = impl_->grammar->fork();
         impl_->preview_grammar->accept(tokens);
@@ -769,6 +772,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_ready = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
+        .continuation                 = complete ? runtime::ContinuationAction::Decode
+                                                 : runtime::ContinuationAction::ApplyTargetControl,
         .prefix_execution_split_after = impl_->preview_execution_split_after,
     };
 }

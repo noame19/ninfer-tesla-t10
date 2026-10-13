@@ -722,6 +722,10 @@ public:
     [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
         return base.isolated_feasible;
     }
+    bool auxiliary_tier_available = true;
+    [[nodiscard]] bool temporary_request_feasible(const FakeRequestBasePlan&) const noexcept {
+        return auxiliary_tier_available;
+    }
 
     // Tokens a prompt shares with an owner's ledger: matched_tokens[id] when the content keys
     // agree, else zero.
@@ -2820,16 +2824,16 @@ void test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchor
     FakeManager near_manager = make_manager(1, 2);
     FakeProgram near_program;
     near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens + 1};
-    const ActiveRequest near = start_active(near_manager, near_program, 7, make_base(7), 1);
-    (void)finish_active(near_manager, near_program, near, 4096);
-    near_program.matched_tokens[near.sequence.id] = 4200;
+    const ActiveRequest near_request = start_active(near_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(near_manager, near_program, near_request, 4096);
+    near_program.matched_tokens[near_request.sequence.id] = 4200;
     require(!near_manager.endpoint_anchor_frontier(near_program, prompt),
             "an endpoint within the minimum gain of an anchor was anchored again");
     near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens};
     FakeManager far_manager = make_manager(1, 2);
-    const ActiveRequest far = start_active(far_manager, near_program, 7, make_base(7), 1);
-    (void)finish_active(far_manager, near_program, far, 4096);
-    near_program.matched_tokens[far.sequence.id] = 4200;
+    const ActiveRequest far_request = start_active(far_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(far_manager, near_program, far_request, 4096);
+    near_program.matched_tokens[far_request.sequence.id] = 4200;
     require(far_manager.endpoint_anchor_frontier(near_program, prompt) == 4096U,
             "an endpoint a full minimum gain above an anchor was not anchored");
 }
@@ -3190,6 +3194,18 @@ void test_admission_waits_for_program_boundary() {
     (void)finish_active(manager, program, admitted);
     (void)finish_active(manager, program, active);
     require(program.finish_calls == 2, "retry admission damaged the already active request");
+}
+
+void test_auxiliary_host_pressure_waits_without_rejecting_request() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    program.auxiliary_tier_available = false;
+    const auto blocked = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 1);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "temporary Host pressure rejected or admitted the queued request");
+    program.auxiliary_tier_available = true;
+    const auto available = manager.inspect(program, FakePreparedPrompt{17}, make_base(17), 1);
+    require(available.choice.has_value(), "released Host reservation did not unblock admission");
 }
 
 void test_retained_source_is_protected_until_terminal() {
@@ -5496,6 +5512,7 @@ int main() {
              test_read_only_and_declared_boundary_reuse_retain_the_source);
     run_test("read-only request leaves the catalog unchanged",
              test_read_only_request_leaves_the_catalog_unchanged);
+    run_test("auxiliary Host pressure", test_auxiliary_host_pressure_waits_without_rejecting_request);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
     run_test("admission waits for Program boundary", test_admission_waits_for_program_boundary);
     run_test("session publication order", test_session_publication_order_controls_tied_source);

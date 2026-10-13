@@ -58,10 +58,12 @@ private:
     // One device weight per distinct input-gather binding, the same way.
     WeightId input_columns(const artifact::Binding& binding, std::uint64_t width,
                            const std::string& use);
+    WeightId auxiliary_on_rank(WeightId id, std::size_t rank);
 
     std::map<std::string, WeightId, std::less<>> parameters_;
     std::map<std::string, WeightId, std::less<>> signs_;
     std::map<std::string, WeightId, std::less<>> columns_;
+    std::map<std::pair<std::size_t, std::size_t>, WeightId> auxiliary_ranks_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,

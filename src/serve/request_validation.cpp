@@ -19,6 +19,14 @@ namespace ninfer::serve {
     throw ApiException(std::move(error));
 }
 
+void parse_tool_constraints(const RequestJson& body, GenerationRequest& request) {
+    if (!body.contains("tool_constraints") || body.at("tool_constraints").is_null()) return;
+    const auto& mode = body.at("tool_constraints");
+    if (mode == "basic") request.tool_choice.constraints = ToolConstraintMode::Basic;
+    else if (mode == "auto") request.tool_choice.constraints = ToolConstraintMode::Automatic;
+    else bad_request("tool_constraints must be 'basic' or 'auto'", "tool_constraints");
+}
+
 std::optional<int> optional_int(const RequestJson& object, const char* key) {
     if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
     const RequestJson& value = object.at(key);

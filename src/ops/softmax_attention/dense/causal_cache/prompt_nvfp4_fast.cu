@@ -41,14 +41,14 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
     const auto invoke = [&]<class Metadata>(Metadata metadata, const std::int32_t* valid) {
         const auto launch = [&]<int Warps, bool Split>() {
             using Shape = CausalPromptRotatedShape<Warps>;
-            constexpr auto kernel =
-                causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>;
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            Shape::SmemBytes);
+            configure_cuda_device_once([] {
+                return cudaFuncSetAttribute(
+                    causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
             });
             const dim3 grid(div_up(width, Shape::Br), G::QHeads, plan.splits);
-            kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
+            causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>
+                <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 q_data, keys, values, key_scales, value_scales, metadata, pos, scale, out_data,
                 width, static_cast<float*>(partials.rows.data),
                 static_cast<float2*>(partials.stats.data));

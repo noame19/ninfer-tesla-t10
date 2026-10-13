@@ -133,8 +133,9 @@ struct SpeculativeOptions {
     std::uint32_t lookup_ngram = 0;
     // MTP only; Adaptive verifies 1..draft_tokens drafts per round.
     MtpDraftPolicy mtp_policy = MtpDraftPolicy::Fixed;
-    // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
+    // Optional target-verified copy proposals with MTP, DFlash or DFlash2.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
+    // Engine clamps valid widths above 15 to 15 when max_concurrency > 1, at construction.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
     // CPU-only retention, separate from KV. Zero keeps request-local drafting.
@@ -486,6 +487,43 @@ struct NgramTableOptions {
     bool disabled = false;
 };
 
+enum class CudaMemoryPolicy : std::uint8_t {
+    DriverDefault,
+    StrictVram,
+    Mixed,
+};
+
+// Optional sparse KV working set. B and R are independent whole-page budgets;
+// Host retains native page records, including quantization scale planes.
+struct KvmemOptions {
+    bool lrfu = false;
+    double lrfu_lambda = 0.5;
+    double lrfu_top_fraction = 0.9;
+    bool score_agg_max = false;
+    std::uint32_t selected_tokens = 0; // B; zero disables KVMem
+    std::uint32_t reserve_tokens = 0;  // R; also covers each prefill chunk
+    // Whole-page rounding uses this backend's fixed 64-token page.
+    // Sink 0 keeps one page; a positive value rounds down and stays at least one page.
+    // Recent rounds down and must retain at least one page for the partial append tail.
+    // Values below 64 are rejected when KVMem is enabled; the default keeps one page.
+    std::uint32_t sink_tokens = 0;
+    std::uint32_t recent_tokens = 64;
+    std::uint64_t host_bytes = 0;      // H; hard bound on archived native payload
+    [[nodiscard]] std::uint32_t sink_blocks() const noexcept {
+        return sink_tokens < 64 ? 1U : sink_tokens / 64U;
+    }
+    [[nodiscard]] std::uint32_t recent_blocks() const noexcept { return recent_tokens / 64U; }
+    std::uint32_t retained_sessions = 4; // bounded inactive Host histories, 1..16
+    bool verify_transfers = false;    // correctness diagnostics, off in product runs
+    // Process-local active/idle native KV tier. H bounds resident payload; D
+    // bounds reserved disk extents. No restart persistence or DirectStorage.
+    std::filesystem::path disk_path;
+    std::uint64_t disk_bytes = 0;
+    [[nodiscard]] std::uint64_t device_tokens() const noexcept {
+        return static_cast<std::uint64_t>(selected_tokens) + reserve_tokens;
+    }
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -516,6 +554,8 @@ struct EngineOptions {
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
     // max_context / native (ops::RopeYarn).
+    // Per-request bounded working sets, including layer pipelines; RoPE positions stay logical.
+    KvmemOptions kvmem;
     bool rope_yarn = false;
     // A fixed YaRN factor in (1,4] for every position of the text and MTP layers, whatever
     // max_context is: Qwen documents one factor per deployment rather than one per window. 1 leaves
@@ -528,8 +568,8 @@ struct EngineOptions {
     float rope_scaling_factor = 1.0F;
     // The interpolation threshold; 0 is the model's native window.
     std::uint32_t rope_scaling_original_context = 0;
-    // Reserves the grammar mask planes that JSON and JSON Schema constrained requests sample
-    // through. Off, those requests are refused and a DFlash round carries no grammar stage.
+    // Enables JSON/JSON Schema request formats. Native tool constraints are available by default
+    // and share the per-lane mask planes even when JSON request formats are disabled.
     bool structured_output = false;
     // Admit waiting requests to free lanes while other requests prefill, instead of holding
     // admission until the staged prefill finishes.
@@ -544,6 +584,17 @@ struct EngineOptions {
     // on the grounds that WDDM will evict other allocations. Not for a GPU that drives the
     // desktop, whose allocations are often not evictable.
     bool wddm_evictable_budget         = false;
+    // StrictVram is a Windows single-device residency guard and selects the Hybrid prefix cache.
+    // Mixed is Windows single-device text generation using ordinary cudaMalloc: it attempts the
+    // requested capacity even above reported CUDA free and accepts driver paging to Shared memory.
+    // Mixed automatic capacity covers at most max_concurrency full max_context windows, without
+    // expanding an idle prefix cache or probing system RAM. Normalization sets its automatic
+    // headroom to zero; StrictVram sets it to cuda_vram_reserve_bytes. Only DriverDefault uses
+    // the independently configured automatic KV headroom.
+    // StrictVram probes may exceed reported free, but only a verified resident layout is admitted.
+    CudaMemoryPolicy cuda_memory_policy = CudaMemoryPolicy::DriverDefault;
+    std::size_t cuda_vram_reserve_bytes = 64ULL << 20;
+    std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;
     ModelSuspendOptions suspend;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
@@ -751,7 +802,17 @@ struct NgramSessionHints {
     // prior generated proposals must not reuse the random draws that produced them.
 };
 
+enum class ToolChoiceMode : std::uint8_t { Auto, None, Required };
+enum class ToolConstraintMode : std::uint8_t { Automatic, Basic };
+struct ToolChoice {
+    ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::optional<std::vector<std::string>> allowed_names;
+    bool parallel = true;
+    ToolConstraintMode constraints = ToolConstraintMode::Basic;
+};
+
 struct RequestOptions {
+    ToolChoice tool_choice;
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
@@ -1030,6 +1091,7 @@ enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
     MediaBudgetExceeded,
     InvalidMedia,
+    InvalidToolConstraint,
     Overloaded,
     QueueTimeout,
     Cancelled,
@@ -1491,7 +1553,47 @@ struct DeviceMemorySummary {
     std::size_t expert_cache_bytes = 0;
 };
 
+// Latest observed process residency, not a permanent physical-pinning guarantee. Intentional
+// pinned Host allocations are established before shared_baseline_bytes; device-driven growth
+// above that baseline invalidates a strict candidate. Zero counters while disabled are unknown.
+struct CudaResidencySummary {
+    bool enabled = false;
+    bool verified = false;
+    std::size_t cuda_free_bytes = 0;
+    std::size_t cuda_total_bytes = 0;
+    std::size_t dedicated_bytes = 0;
+    std::size_t shared_bytes = 0;
+    std::size_t shared_baseline_bytes = 0;
+    std::size_t device_allocated_bytes = 0;
+    std::size_t host_pool_bytes = 0;
+    std::size_t host_used_bytes = 0;
+    std::size_t verified_reserve_bytes = 0;
+};
+
+// Gauges of the current KVMem history (active or retained), not process-lifetime
+// counters. Payload H excludes statistics, checkpoint images and native workspace.
+struct KvmemMemorySummary {
+    bool enabled = false;
+    std::uint32_t selected_tokens = 0, reserve_tokens = 0;
+    std::uint64_t host_payload_budget_bytes = 0, host_payload_bytes = 0;
+    std::uint64_t disk_payload_budget_bytes = 0, disk_payload_bytes = 0;
+    std::uint64_t retained_payload_budget_bytes = 0;
+    std::uint64_t disk_read_bytes = 0, disk_written_bytes = 0;
+    std::uint64_t statistics_bytes = 0, checkpoint_bytes = 0;
+    std::uint64_t transfer_staging_bytes = 0;
+    std::uint64_t statistics_staging_bytes = 0;
+    std::uint32_t mtp_resident_pages = 0;
+    std::uint32_t retained_sessions = 0;
+    std::uint64_t history_hits = 0, history_misses = 0, history_evictions = 0;
+    std::uint64_t disk_hits = 0, disk_writes = 0, disk_errors = 0;
+    std::uint64_t active_payload_reservation_bytes = 0;
+    std::uint32_t evaluated_tokens = 0, checkpoint_tokens = 0, resident_pages = 0;
+    std::uint32_t history_swaps = 0;
+    std::uint64_t history_spilled_bytes = 0, history_restored_bytes = 0;
+};
+
 struct MemorySummary {
+    KvmemMemorySummary kvmem;
     int device                                = 0;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
@@ -1527,6 +1629,7 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
+    CudaResidencySummary cuda_residency;
     // Qwen3.8-Flash-Next host or disk experts: device memory lent to the expert cache, over every
     // device.
     std::size_t expert_cache_bytes = 0;
@@ -1566,7 +1669,10 @@ struct RuntimeHostWorkStats {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    KvmemMemorySummary kvmem;
     RuntimeHostWorkStats host_work;
+    // Published by the worker so monitoring never takes the execution lock or queries CUDA/PDH.
+    CudaResidencySummary cuda_residency;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.

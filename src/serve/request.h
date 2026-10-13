@@ -88,6 +88,7 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string input_schema_json;
+    bool strict = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
 };
@@ -98,13 +99,9 @@ struct ToolCall {
     std::string arguments_json;
 };
 
-enum class ToolChoiceMode {
-    Auto,
-    None,
-};
+using ToolChoiceMode = ninfer::ToolChoiceMode;
 
-struct ToolChoice {
-    ToolChoiceMode mode = ToolChoiceMode::Auto;
+struct ToolChoice : ninfer::ToolChoice {
     // Set when the caller selected one function: `tool_choice` naming it, or a forced choice over
     // exactly one callable tool. Empty leaves the choice to the model.
     std::string forced_name;

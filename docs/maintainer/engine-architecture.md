@@ -573,7 +573,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
 - ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；
 - workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
   使用其内部区域；
-- 多 GPU 时（`--devices A,B,...`，Linux）模型按层切成 pipeline stage，每个 stage 整层拥有自己的权重、
+- 多 GPU 时（`--devices A,B,...`，Linux 或本分支原生 Windows）模型按层切成 pipeline stage，每个 stage 整层拥有自己的权重、
   KV plane、GDN state、replay records 和 workspace，位于各自设备上；仍然是一个 Program、一个 KV page
   allocator（每个 plane 绑定一个 rank）、一个 Scheduler 和一个 commit 序列。embedding、head、round state、
   sampling 和 MTP 留在 rank 0，residual 经 `StageLink` 逐 stage 传递并由最后一个 stage 送回。KV 容量取各设备

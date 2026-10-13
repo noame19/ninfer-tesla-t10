@@ -56,6 +56,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
+    case ninfer::RequestErrorKind::InvalidToolConstraint:
+        error.status = 400;
+        error.param = "tools";
+        error.code = "invalid_tool_constraint";
+        break;
     case ninfer::RequestErrorKind::InvalidMedia:
         error.status = 400;
         error.code   = "invalid_media";
@@ -264,6 +269,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
+    engine_options.kvmem                    = options.kvmem;
     engine_options.max_concurrency          = options.max_concurrency;
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
@@ -292,6 +298,9 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.cuda_graph_allowance_bytes =
         static_cast<std::size_t>(options.cuda_graph_allowance_mib) << 20;
     engine_options.wddm_evictable_budget    = options.wddm_evictable_budget;
+    engine_options.cuda_memory_policy = options.cuda_memory_policy;
+    engine_options.cuda_vram_reserve_bytes = options.cuda_vram_reserve_bytes;
+    engine_options.cuda_memory_probe_step_bytes = options.cuda_memory_probe_step_bytes;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;

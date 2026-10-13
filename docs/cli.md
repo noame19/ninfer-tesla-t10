@@ -236,7 +236,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-parallel-plan.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
+| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux/Windows in this KVMem branch; see the [pipeline guide](maintainer/pipeline-parallel-plan.md)); excludes `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
@@ -248,7 +248,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention (see [serving](serving.md#mtp-attention-window)) | `0` (whole history) |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
+| `--lookup-ngram N` | legacy context-lookup drafting alongside `--spec`; disabled with KVMem, which uses `--ngram-draft-tokens` and `--ngram-min-match` | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |

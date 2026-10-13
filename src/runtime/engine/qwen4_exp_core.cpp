@@ -339,7 +339,7 @@ struct Qwen4ExpCore::Impl {
           reuse_prefixes(options.context_cache.enabled), slots(i.executor->options().sequences) {
         RankBinding bind(device, i.executor->head_rank());
         const std::size_t rows = slots.size();
-        if (structured_output) {
+        { // Native tool grammars share these masks even when JSON formats are disabled.
             token_mask = DeviceBuffer(rows * mask_words() * sizeof(std::uint32_t));
             host_mask =
                 std::make_unique<PinnedHostBuffer>(rows * mask_words() * sizeof(std::uint32_t));
@@ -1204,7 +1204,7 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
         impl_->instance.frontend.thinking_control_token_count());
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
-        options.execution.structured_output);
+        options.execution.structured_output, options.tool_choice);
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);

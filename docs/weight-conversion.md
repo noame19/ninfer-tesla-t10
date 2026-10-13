@@ -63,7 +63,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
-| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
+| `bonsai2_27b_ternary` | Imported ternary T2 text tower, head and token table with explicit Hadamard signs | `ternary` (PQ2_0 or PTQ1_0 GGUF) |
+| `bonsai2_27b_ternary_gguf_mtp` | T2 text and byte-preserving dense GGUF MTP blocks | `ternary`, `gguf` (MTP GGUF), `mtp` (geometry companion) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF) |
 
@@ -193,6 +194,31 @@ with `--lm-head-draft`.
 
 A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
 tensor set and Hadamard metadata before reading anything.
+
+### Ternary text with GGUF MTP blocks
+
+`bonsai2_27b_ternary_gguf_mtp` keeps the Bonsai text tower in T2 and imports the dense
+`blk.64.*` MTP matrices from `--source gguf` in their registered GGUF block formats.
+The separate text GGUF must contain only the validated text tensor set. The HF MTP
+companion supplies the component geometry; its projection values are replaced by the
+explicitly selected GGUF source. The recipe uses the dense exporter's `1 + w` norm
+convention, verified against the Bonsai r3 companion. It does not claim that arbitrary
+MTP exporters use this convention.
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-config-and-tokenizer \
+  --recipe bonsai2_27b_ternary_gguf_mtp --components text,mtp \
+  --source ternary=/path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  --source mtp=/path/to/bonsai-mtp-r3/model_mtp.safetensors \
+  --source gguf=/path/to/Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q4_0.gguf \
+  --device cpu --out models/bonsai2-q4-mtp.ninfer
+```
+
+The local Windows/SM120 qualification used actual Q4_0 MTP weights. Q2_0 and Q5_0
+have artifact and numerical operator checks, with no local real-model samples.
+Weight-format support does not imply KVMem support for `qwen4_exp` or any other
+unadapted model architecture.
 
 ### A mixed-precision Qwen3.8-27B GGUF
 

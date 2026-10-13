@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/resident_memory.h"
 #include "core/device_snapshot.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
@@ -15,6 +16,7 @@
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/worker_fault.h"
+#include "kvmem/memory_contract.hpp"
 
 #include <algorithm>
 #include <array>
@@ -95,6 +97,7 @@ public:
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
           structured_output_(options.structured_output), max_concurrency_(options.max_concurrency),
+          kvmem_enabled_(options.kvmem.selected_tokens != 0),
           thorough_admission_search_(options.context_cache.thorough_admission_search),
           branch_anchors_(options.context_cache.enabled && options.context_cache.branch_anchors),
           endpoint_anchors_(options.context_cache.enabled && options.context_cache.endpoint_anchors),
@@ -314,7 +317,7 @@ public:
                 instance_.frontend.thinking_control_token_count());
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
-                options.execution.structured_output);
+                options.execution.structured_output, options.tool_choice);
             options.execution.grammar = output.grammar_state();
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
@@ -829,6 +832,9 @@ private:
         detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
+        // Sample Program-owned host gauges at the existing execution boundary.
+        // HTTP pollers read only this published snapshot and never query CUDA.
+        if (kvmem_enabled_) snapshot.kvmem = instance_.program->memory_summary().kvmem;
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
@@ -1455,7 +1461,14 @@ private:
         if (instance_.program->has_context_transaction()) { return cancelled; }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                cancelled[lane] = slots_[lane]->cancelled.load(std::memory_order_acquire);
+                cancelled[lane] = slots_[lane]->storage_failure || slots_[lane]->cancelled.load(std::memory_order_acquire);
+                if constexpr (requires { instance_.program->cancel_memory_ready(*slots_[lane]->sequence); }) {
+                    if (cancelled[lane] && slots_[lane]->sequence &&
+                        !instance_.program->cancel_memory_ready(*slots_[lane]->sequence)) {
+                        slots_[lane]->storage_cancelling = true;
+                        cancelled[lane] = false;
+                    }
+                }
             }
         }
         return cancelled;
@@ -1546,6 +1559,13 @@ private:
             if (request->capture_pending) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
+            }
+            if (request->storage_failure) {
+                (void)resources_.abort(*instance_.program, *request->lane, *request->sequence);
+                remove_completed_slot(lane);
+                publish_runtime_stats();
+                complete_error(request, request->storage_failure);
+                continue;
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
@@ -1926,6 +1946,15 @@ private:
                              typename ModelContract::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        if constexpr (requires { progress.waiting_for_storage; }) {
+            // A storage continuation performed no prefill unit. Charging it
+            // here exhausts admission's compute projection merely by waiting.
+            if (progress.waiting_for_storage) {
+                if (progress.complete || progress.processed_prompt_tokens || progress.pending || progress.capture)
+                    throw std::logic_error("storage wait also published prefill work");
+                return;
+            }
+        }
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
@@ -1980,9 +2009,19 @@ private:
     [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
         return scheduler_.select_runnable_prefill_lane(max_concurrency_, [&](std::uint32_t lane) {
             const auto& request = slots_[lane];
-            return request != nullptr && request->is_prefilling() && !request->capture_pending &&
+            if constexpr (requires { instance_.program->memory_pending(*request->sequence); }) {
+                if (request && request->sequence && instance_.program->memory_pending(*request->sequence)) return false;
+            }
+            return request != nullptr && !request->storage_failure && !request->storage_cancelling && request->is_prefilling() && !request->capture_pending &&
                    !(request->sequence && instance_.program->vision_pending(*request->sequence));
         });
+    }
+
+    void fail_storage_request(std::uint32_t lane, const std::exception_ptr& error) {
+        const auto request = slots_[lane];
+        if (!request || !request->lane || !request->sequence)
+            throw std::logic_error("storage failure has no active request owner");
+        request->storage_failure = error;
     }
 
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
@@ -2000,18 +2039,22 @@ private:
         }
         setup.finish();
         ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
-        program_call.finish(progress.timing);
-        cumulative_stats_.prefill_seconds_total +=
-            static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
-        consume_armed_worker_failure();
-        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
-        // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
-        // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
-        // request can be admitted to a free lane while another request is still prefilling.
-        if (!progress.complete && request->is_prefilling()) { request_admission_check(); }
-        publish_runtime_stats();
+        try {
+            auto progress =
+                instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+            program_call.finish(progress.timing);
+            cumulative_stats_.prefill_seconds_total +=
+                static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
+            consume_armed_worker_failure();
+            resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+            // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
+            // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
+            // request can be admitted to a free lane while another request is still prefilling.
+            if (!progress.complete && request->is_prefilling()) { request_admission_check(); }
+            publish_runtime_stats();
+        } catch (const kvmem::MemoryError&) {
+            fail_storage_request(lane, std::current_exception());
+        }
     }
 
     [[nodiscard]] FifoSnapshot pending_snapshot() const {
@@ -2038,6 +2081,7 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
+            request->options.execution.publication_order = request->publication_order;
             std::array<std::uint32_t, 2> anchors{};
             std::size_t anchor_count = 0;
             if constexpr (kLegacyContextCache) {
@@ -2622,7 +2666,8 @@ private:
                 const OutputDecision decision =
                     request->output.preview_control(tokens, request->budget->remaining());
                 if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
-                    decision.continuation != ContinuationAction::Decode ||
+                    (decision.continuation != ContinuationAction::Decode &&
+                     decision.continuation != ContinuationAction::ApplyTargetControl) ||
                     (decision.prefix_execution_split_after &&
                      (*decision.prefix_execution_split_after == 0 ||
                       *decision.prefix_execution_split_after > decision.accepted_tokens))) {
@@ -2668,7 +2713,8 @@ private:
             cumulative_stats_.committed_decode_tokens += membership.row_stride;
             auto timing = record_committed_output(request, membership.row_stride);
             append_output(request, commit_output(*request), std::move(timing));
-            request->model_state = EngineRequestState::DecodeReady;
+            request->model_state = request->output.pending_control_tokens().empty()
+                ? EngineRequestState::DecodeReady : EngineRequestState::ControlReady;
         }
         publish_runtime_stats();
     }
@@ -2926,18 +2972,36 @@ private:
         published_residency_ = std::move(status);
     }
 
+    [[nodiscard]] std::shared_ptr<core::ResidentMemorySession> residency_session() const {
+        if constexpr (requires { instance_.residency; }) {
+            return instance_.residency;
+        } else {
+            return {};
+        }
+    }
+
     void worker_loop() noexcept {
+        const auto residency = residency_session();
+        core::ResidentMemoryBinding resident_binding(residency);
+        Clock::time_point last_residency_check{};
         bool previous_unit_was_decode = false;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
                     bool active = materializing_.has_value();
+                    if constexpr (requires { instance_.program->memory_maintenance_pending(); })
+                        active = active || instance_.program->memory_maintenance_pending();
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        if (residency) {
+                            queue_cv_.wait_for(lock, std::chrono::milliseconds(250),
+                                               [&] { return stopping_ || !pending_.empty(); });
+                        } else {
+                            queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        }
                     }
                 }
                 if (stopping_) {
@@ -2973,8 +3037,19 @@ private:
                 continue;
             }
             try {
+                if (residency && Clock::now() - last_residency_check >=
+                                     std::chrono::milliseconds(250)) {
+                    residency->check("runtime boundary");
+                    last_residency_check = Clock::now();
+                }
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
+                if constexpr (requires { instance_.program->progress_memory_storage(); }) {
+                    if (instance_.program->progress_memory_storage()) {
+                        request_admission_check();
+                        publish_runtime_stats();
+                    }
+                }
                 const bool have_pending       = expire_pending_requests();
                 // A pure queue wait changes no state that would publish, so the waits /stats
                 // reports are refreshed here.
@@ -2999,6 +3074,7 @@ private:
                         previous_unit_was_decode,
                         instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
+                    if (residency) { residency->check("request admission"); }
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }
@@ -3008,8 +3084,34 @@ private:
                 // not reinterpret an already-issued unit with a later atomic read.
                 const auto cancelled_at_unit_start = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_unit_start, boundary);
-                const ControlMembership control_membership =
-                    scheduler_.build_control_membership(slots_, max_concurrency_);
+                std::uint32_t control_chunk = UINT32_MAX;
+                if constexpr (requires { instance_.program->memory_control_chunk(); }) {
+                    control_chunk = instance_.program->memory_control_chunk();
+                }
+                ControlMembership control_membership =
+                    scheduler_.build_control_membership(slots_, max_concurrency_, control_chunk);
+                if constexpr (requires { instance_.program->prepare_control_memory(control_membership.sequences[0], control_membership.row_stride); }) {
+                    std::size_t ready = 0;
+                    for (std::size_t row = 0; row < control_membership.size; ++row) {
+                        try {
+                            if (!instance_.program->prepare_control_memory(control_membership.sequences[row],
+                                    control_membership.row_stride)) continue;
+                        } catch (const kvmem::MemoryError&) {
+                            fail_storage_request(control_membership.lanes[row], std::current_exception());
+                            continue;
+                        }
+                        if (ready != row) {
+                            control_membership.lanes[ready] = control_membership.lanes[row];
+                            control_membership.sequences[ready] = control_membership.sequences[row];
+                            std::copy_n(control_membership.tokens.begin() + row * control_membership.row_stride,
+                                control_membership.row_stride,
+                                control_membership.tokens.begin() + ready * control_membership.row_stride);
+                        }
+                        ++ready;
+                    }
+                    control_membership.size = ready;
+                    control_membership.tokens.resize(ready * control_membership.row_stride);
+                }
                 if (!control_membership.empty()) {
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -3019,6 +3121,25 @@ private:
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+
+                if constexpr (requires { instance_.program->prepare_decode_memory(membership.sequences[0]); }) {
+                    std::size_t ready = 0;
+                    for (std::size_t row = 0; row < membership.size; ++row) {
+                        try {
+                            if (!instance_.program->prepare_decode_memory(membership.sequences[row])) continue;
+                        } catch (const kvmem::MemoryError&) {
+                            fail_storage_request(membership.lanes[row], std::current_exception());
+                            continue;
+                        }
+                        if (ready != row) {
+                            membership.lanes[ready] = membership.lanes[row];
+                            membership.sequences[ready] = membership.sequences[row];
+                            membership.budgets[ready] = membership.budgets[row];
+                        }
+                        ++ready;
+                    }
+                    membership.size = ready;
+                }
 
                 const std::uint64_t prefill_mask = scheduler_.prefill_lane_mask();
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -3140,6 +3261,7 @@ private:
     const std::uint32_t max_context_;
     const bool structured_output_;
     const std::uint32_t max_concurrency_;
+    const bool kvmem_enabled_;
     const bool thorough_admission_search_;
     const bool branch_anchors_;
     const bool endpoint_anchors_;

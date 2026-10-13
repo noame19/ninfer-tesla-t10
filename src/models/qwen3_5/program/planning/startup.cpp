@@ -133,7 +133,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
-    const std::uint32_t logical_pages  = page_count(plan.capacity);
+    const std::uint32_t logical_pages  = page_count(plan.kvmem_window_tokens ? plan.kvmem_window_tokens : plan.capacity);
     const std::uint32_t physical_pages = plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
@@ -180,7 +180,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         qwen3_5::DecoderStateSpec{
             .full_attention_layers     = config.full_attention_layers,
             .mtp_layers                = 1,
-            .capacity                  = plan.capacity,
+            .capacity                  = plan.kvmem_window_tokens ? plan.kvmem_window_tokens : plan.capacity,
             .kv_heads                  = dimension(config.attention->num_key_value_heads),
             .attention_head_dim        = dimension(config.attention->head_dim),
             .kv_storage                = plan.kv_storage,
@@ -313,6 +313,37 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
+    if (plan.kvmem_window_tokens) {
+        const auto buckets = (effective_prefill_chunk + 126) / 64;
+        out.memory_statistics.resize(ranks);
+        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+            if (config.layer_types[layer] == MixerKind::FullAttention) {
+                ++out.memory_statistics[parameters.text.layers[layer].rank].layers;
+            }
+        }
+        std::uint32_t first_layer = 0;
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            auto& stats = out.memory_statistics[rank];
+            stats.first_layer = first_layer;
+            first_layer += stats.layers;
+            if (!stats.layers) { continue; }
+            auto& local = builders[rank];
+            const auto layers = dimension(stats.layers);
+            stats.key_sums = add_tensor(local, DType::FP32,
+                {dimension(config.attention->key_width()), buckets, layers}, "memory key sums");
+            stats.candidate_keys = add_tensor(local, DType::FP32,
+                {dimension(config.attention->key_width()),
+                 dimension((widest_verify_window(plan) + 1) * plan.max_concurrency), layers},
+                 "memory candidate keys");
+            stats.candidate_origin = add_tensor(local, DType::I32, {1}, "memory candidate origin");
+            stats.query_sums = add_tensor(local, DType::FP32,
+                {dimension(config.attention->query_width()), 1, layers}, "memory query sums");
+            stats.ranges = add_tensor(local, DType::I32, {4}, "memory statistics ranges");
+        }
+        // Prefill sets the origin on rank 0; the stage control block carries it onward.
+        out.memory_statistics.front().prefill_origin =
+            add_tensor(builder, DType::I32, {1}, "memory logical prefill origin");
+    }
     if (plan.causal_scoring) {
         out.score_hidden =
             add_tensor(builder, DType::BF16,
@@ -325,7 +356,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                              {dimension(parameters.model.resources().public_token_count),
                                               static_cast<std::int32_t>(plan.max_concurrency)},
                                              "sampling token counts");
-        if (plan.structured_output) {
+        { // Every generation lane can receive a default constrained tool request.
             out.grammar_masks =
                 add_tensor(builder, DType::I32,
                            {static_cast<std::int32_t>(
@@ -365,7 +396,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
-WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
+    auto plan = source_plan;
+    if (plan.kvmem_window_tokens) { plan.capacity = plan.kvmem_window_tokens; }
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
 
@@ -412,7 +445,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
-        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : 0,
+        (void)workspace::text_prefill_roots(layout, config, tokens, plan.features.vision ? 3 : (plan.kvmem_window_tokens ? 1 : 0),
                                             plan.features.vision ? tokens : 0,
                                             plan.features.host_staged_vision());
     };
@@ -979,19 +1012,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                                     " pipeline stages but " + std::to_string(device.size()) +
                                     " devices are attached");
     }
-    if (parameters.text.split_execution() && options.enable_vision) {
-        // The stage loop carries the text passes, DFlash's feature taps included; Vision is refused
-        // until it is taught the stages.
-        throw std::invalid_argument(
-            "vision is not yet supported with a multi-device --devices split");
+    if (parameters.text.split_execution()) {
+        // DFlash feature capture still assumes primary-device target layers.
+        const auto unsupported = [](const char* feature) {
+            throw std::invalid_argument(
+                std::string(feature) +
+                " is not yet supported with a multi-device --devices split");
+        };
+        if (options.speculative.backend == SpeculativeBackend::DFlash ||
+            options.speculative.backend == SpeculativeBackend::DFlash2) {
+            unsupported("DFlash speculative decoding");
+        }
     }
-    const std::uint32_t logical_pages = page_count(options.max_context);
+    const std::uint32_t logical_pages = page_count(options.kvmem.device_tokens()
+        ? options.kvmem.device_tokens() : options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         maximum_main_page_groups(options.max_concurrency, logical_pages, options.context_cache);
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        if (!options.kvmem.device_tokens() && options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
@@ -1072,6 +1112,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     auto impl                 = std::make_unique<SequencePlanImpl>();
     impl->parameters          = inputs.parameters;
     impl->capacity            = inputs.capacity;
+    impl->kvmem_window_tokens = inputs.kvmem_window_tokens;
+    impl->kvmem = inputs.kvmem;
     impl->main_page_groups    = main_page_groups;
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
@@ -1143,7 +1185,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(
                 graph_topology_allowance(
-                    ordinary_graph_profiles(impl->capacity, attention_geometry, impl->kv_storage),
+                    ordinary_graph_profiles(impl->kvmem_window_tokens ? impl->kvmem_window_tokens : impl->capacity, attention_geometry, impl->kv_storage),
                     [](GraphExecutionProfile) { return 12ULL * kMiB; },
                     "ordinary graph allowance"),
                 impl->max_concurrency, "ordinary exact-b graph allowance");
@@ -1152,7 +1194,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // rounds one more at the ngram window for every batch size they admit.
             const auto family_allowance = [&](std::uint32_t verify_window) {
                 const auto profiles =
-                    mtp_graph_profiles(impl->capacity, verify_window, impl->draft_window,
+                    mtp_graph_profiles(impl->kvmem_window_tokens ? impl->kvmem_window_tokens : impl->capacity, verify_window, impl->draft_window,
                                        attention_geometry, impl->kv_storage);
                 return graph_topology_allowance(
                     profiles,
@@ -1342,6 +1384,7 @@ ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
 std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
                                       const EngineOptions& options) {
     const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
+    if (options.kvmem.device_tokens()) { return requested; }
     static const bool align = [] {
         const char* value = std::getenv("NINFER_PREFILL_ALIGN");
         return value == nullptr || value[0] != '0';
@@ -1385,7 +1428,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache              = options.context_cache,
         .resident_main_pages        = resident_main_pages,
     };
-    const std::uint32_t logical_pages = page_count(inputs.capacity);
+    inputs.kvmem_window_tokens = static_cast<std::uint32_t>(options.kvmem.device_tokens());
+    inputs.kvmem = options.kvmem;
+    const std::uint32_t logical_pages = page_count(inputs.kvmem_window_tokens ? inputs.kvmem_window_tokens : inputs.capacity);
     // Injected graft prefixes hold their Main pages for good, on top of what requests use.
     const std::uint64_t minimum_pages64 =
         static_cast<std::uint64_t>(std::max(logical_pages, inputs.max_concurrency)) +

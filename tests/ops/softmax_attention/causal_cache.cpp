@@ -4331,6 +4331,13 @@ int run_softmax_attention_dflash2_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+int run_softmax_attention_rk8v4_tests() {
+    if (cuda_unavailable()) return 77;
+    const int failures = run_rk8v4_cases();
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention rk8v4\n";
+    return failures == 0 ? 0 : 1;
+}
+
 int run_softmax_attention_causal_cache_tests() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";

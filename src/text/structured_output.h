@@ -39,6 +39,10 @@ public:
     ~StructuredCompiler();
     std::shared_ptr<GrammarState> compile(const StructuredOutputOptions& options,
                                           const StructuredOutputEnvelope& envelope = {});
+    std::shared_ptr<GrammarState> compile_model(const std::string& grammar_source,
+                                               const StructuredOutputOptions& body,
+                                               const std::string& reasoning_close,
+                                               const std::string& continuation = {});
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

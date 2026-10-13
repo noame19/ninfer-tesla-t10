@@ -20,9 +20,9 @@ each stage read its weights once per micro-batch and win nothing.
 **It is not tensor parallelism.** No layer is divided across devices, so no collective runs inside a
 layer.
 
-**Multi-GPU is a Linux feature.** Repeating one device id (`--devices 0,0`) exercises the whole
-stage path on a single card and is accepted everywhere, which is how the path is tested without a
-second GPU. Distinct ids are refused on Windows.
+**This KVMem branch enables native Windows as well as Linux.** Repeating one device id
+(`--devices 0,0`) remains useful for single-card stage tests. Physical-device qualification must
+also use distinct ids; identical compute capability is required by `DeviceContext`.
 
 ## How it works
 
@@ -65,12 +65,34 @@ second GPU. Distinct ids are refused on Windows.
   (`ScopedDeviceRank`, `ScopedArenaRank`), receives the residual and control block, runs the stage's
   layers and passes the residual on.
 
-## What is not covered yet
+## KVMem Host history and selection
 
-- **Vision** is refused with a split, in every residency: overlay at load, before the weights (a
-  later stage holds whole layers and nothing a Vision window could borrow), resident and CPU Vision
-  at sequence planning, once they have loaded. The stage loop has not been taught the Vision
-  prefill.
+KVMem retains one logical history, one global payload quota and one set of selected positions.
+KV and StateImage transfers reuse the upstream rank-aware pools and `RankStreams`. Normalized
+pre-RoPE key/query statistics are computed on each attention layer's owning rank, then gathered
+into Host buffers in global attention-layer order. Query token counts advance once per logical
+chunk. The logical prefill origin rides the existing control link, including multimodal `[3,T]`
+positions; speculative key columns use local origins and only the accepted prefix enters history.
+
+The main pool still has `C * (B + R)` logical token capacity; it is not divided by GPU count.
+Each rank's statistics and workspace enter its own authoritative reservation curve. Resident
+Vision weights/workspace and MTP remain on rank 0; CPU Vision uses the existing Host encoder.
+
+## Current restrictions
+
+- **DFlash/DFlash2** are refused when the model spans more than one device. DFlash reads
+  layer outputs from several depths (its feature taps) into rank 0 buffers, which from a later stage
+  are another device's memory; they need to cross the stage boundaries first.
+- **Vision works, entirely on rank 0.** The tower, its encode workspace and the handoff live on the
+  first device, and the visual columns are scattered into the residual before the stage loop, so a
+  stage sees an ordinary residual; the multimodal `[3,T]` rope positions ride the control block.
+  A resident tower is added to rank 0's share in `default_stage_layers`. `--vision-residency overlay`
+  keeps its single-device meaning: the window is borrowed from rank 0's evictable tail (embedding,
+  head, MTP) or rank 0's free KV granules (`lendable_kv_end_bytes` counts rank 0 planes only; a
+  lent granule removes those page ids from admission on every rank). Overlay remains unqualified
+  on distinct GPUs and is rejected by KVMem. Resident and CPU Vision are qualified on physical
+  RTX 5060 Ti / RTX 5050 Laptop stages without P2P; see the parent
+  [KVMem qualification report](../../../../docs/ninfer-multigpu-validation-20261006.md).
 - **Prefill does not overlap stages.** A prefill chunk runs through the stages in turn and the
   engine synchronizes after each chunk, so at any moment one stage is busy. Overlapping stages needs
   micro-chunks inside a chunk (later stages start on micro-chunk 0 while stage 0 runs micro-chunk 1);
