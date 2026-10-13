@@ -441,13 +441,6 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
     }
 }
 
-// The FP16 prefill route's activation conversion: contiguous, one element per thread.
-__global__ void convert_bf16_to_f16_kernel(const __nv_bfloat16* __restrict__ x,
-                                           __half* __restrict__ out, std::int64_t count) {
-    const std::int64_t index = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < count) { out[index] = __float2half_rn(__bfloat162float(x[index])); }
-}
-
 template <ggml_type type, int threads, typename dst_t>
 void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
                        const std::int32_t* row_ids, int rows, dst_t* out,
@@ -936,57 +929,6 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
             throw std::runtime_error("gguf dequantized product: cublasGemmEx failed");
         }
     }
-}
-
-int dequantized_rows_per_pass_f16(int k, std::size_t scratch_bytes) {
-    const std::size_t row = std::size_t(k) * sizeof(__half);
-    return static_cast<int>(std::min<std::size_t>(scratch_bytes / row, 1U << 20) / 128 * 128);
-}
-
-void convert_bf16_to_f16(const __nv_bfloat16* x, int k, int columns, __half* out,
-                         cudaStream_t stream) {
-    const std::int64_t count = std::int64_t(k) * columns;
-    if (count <= 0) { return; }
-    constexpr int kThreads = 256;
-    detail::convert_bf16_to_f16_kernel<<<static_cast<unsigned>((count + kThreads - 1) / kThreads),
-                                         kThreads, 0, stream>>>(x, out, count);
-    detail::check(cudaGetLastError(), "bf16 to f16 conversion launch");
-}
-
-void dequantized_product_f16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
-                             int k, const __half* x, int columns, float* out,
-                             std::int64_t out_column_stride, void* scratch,
-                             std::size_t scratch_bytes, cudaStream_t stream) {
-    const int pass = dequantized_rows_per_pass_f16(k, scratch_bytes);
-    if (pass <= 0) {
-        throw std::invalid_argument("gguf dequantized f16 product: scratch too small");
-    }
-    cublasHandle_t blas = detail::blas_handle();
-    if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("gguf: cublasSetStream failed");
-    }
-    auto* rows_f16    = static_cast<__half*>(scratch);
-    const float alpha = 1.0f;
-    const float beta  = 0.0f;
-    for (int first = 0; first < rows; first += pass) {
-        const int count = std::min(pass, rows - first);
-        dequantize_rows(type, static_cast<const char*>(weight) + first * row_bytes, row_bytes, k,
-                        nullptr, count, rows_f16, k, stream);
-        const cublasStatus_t status = cublasGemmEx(
-            blas, CUBLAS_OP_T, CUBLAS_OP_N, count, columns, k, &alpha, rows_f16, CUDA_R_16F, k,
-            x, CUDA_R_16F, k, &beta, out + first, CUDA_R_32F,
-            static_cast<int>(out_column_stride), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("gguf dequantized f16 product: cublasGemmEx failed");
-        }
-    }
-}
-
-void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
-                     const std::int32_t* row_ids, int rows, __half* out,
-                     std::int64_t out_row_stride, cudaStream_t stream) {
-    detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
-                                stream);
 }
 
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,

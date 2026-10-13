@@ -3,7 +3,6 @@
 #include "core/layout.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,19 +17,6 @@ constexpr std::size_t kDequantizedScratchBytes = std::size_t{16} << 20;
 constexpr std::int32_t kDequantizedVectorColumns = 64;
 // The widest stream-k fixup plane any launch can ask for: one 128 x 128 FP32 tile per SM.
 constexpr std::size_t kFixupTileBytes = 128 * 128 * sizeof(float);
-
-// NINFER_GGUF_PREFILL_F16=1 sends every wide GGUF prefill product through the FP16 dequantize +
-// cuBLAS route instead of the int8 MMQ kernel. Turing has no native BF16 GEMM -- cuBLAS measures
-// about 4.5 TFLOP/s there in BF16 against about 43 in FP16 with an FP32 accumulator -- while its
-// int8 MMQ runs at about 33. The dequantize pass costs extra bandwidth that the prefill phase does
-// not use. Off by default: it is a route change, so it is measured and qualified before it ships.
-bool prefill_f16() {
-    static const bool on = [] {
-        const char* value = std::getenv("NINFER_GGUF_PREFILL_F16");
-        return value != nullptr && *value != '\0' && *value != '0';
-    }();
-    return on;
-}
 
 std::int64_t row_bytes(const Weight& w) {
     const auto block = gguf_block_shape(w.qtype);
@@ -161,9 +147,6 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
         }
         rows = std::max<std::size_t>(rows, shape.rows);
     }
-    // The FP16 route replaces every wide product, so its scratch and activation buffers are always
-    // part of the plan when it is on.
-    if (prefill_f16()) { dequantized = true; }
     // Every product may carry its own input gather, so each may quantize its own activation.
     const std::size_t activations = shapes.size();
     std::size_t widest            = 0;
@@ -188,12 +171,6 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
             (void)layout.alloc_bytes(gguf::matrix_activation_bytes(k, t));
         }
         if (dequantized) { (void)layout.alloc_bytes(std::size_t(k) * t * 2); }
-        if (prefill_f16()) {
-            // One FP16 activation per gathered column set, alongside the BF16 staging buffer above.
-            for (std::size_t i = 0; i < activations; ++i) {
-                (void)layout.alloc_bytes(std::size_t(k) * t * sizeof(__half));
-            }
-        }
         widest = std::max(widest, layout.peak_bytes(1));
     }
     return widest;
@@ -237,17 +214,11 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         void* data;
     };
     std::vector<Activation> activations;
-    struct F16Activation {
-        const std::int32_t* columns;
-        const __half* data;
-    };
-    std::vector<F16Activation> f16_activations;
-    const bool use_f16      = prefill_f16();
     std::int32_t plane_rows = 0;
     bool dequantized        = false;
     for (const auto& p : products) {
         plane_rows = std::max(plane_rows, p.weight->n);
-        dequantized |= !matrix_kernel(*p.weight) || use_f16;
+        dequantized |= !matrix_kernel(*p.weight);
     }
     auto* plane = static_cast<float*>(
         workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
@@ -266,28 +237,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
         float* out        = direct ? p.f32 + p.row : plane;
         const std::int64_t stride = direct ? p.f32_rows : w.n;
-        if (use_f16) {
-            auto found = std::find_if(f16_activations.begin(), f16_activations.end(),
-                                      [&](const F16Activation& a) {
-                                          return a.columns == w.input_columns;
-                                      });
-            if (found == f16_activations.end()) {
-                const __nv_bfloat16* source = xb;
-                if (w.input_columns != nullptr) {
-                    auto* gathered = static_cast<__nv_bfloat16*>(
-                        workspace.alloc_bytes(std::size_t(k) * t * 2).data);
-                    gguf::gather_columns(xb, k, t, w.input_columns, gathered, stream);
-                    source = gathered;
-                }
-                auto* data = static_cast<__half*>(
-                    workspace.alloc_bytes(std::size_t(k) * t * sizeof(__half)).data);
-                gguf::convert_bf16_to_f16(source, k, t, data, stream);
-                f16_activations.push_back({w.input_columns, data});
-                found = f16_activations.end() - 1;
-            }
-            gguf::dequantized_product_f16(type, w.qdata, row_bytes(w), w.n, k, found->data, t, out,
-                                          stride, scratch, kDequantizedScratchBytes, stream);
-        } else if (gguf::has_matrix_kernel(type)) {
+        if (gguf::has_matrix_kernel(type)) {
             const int layout = gguf::matrix_activation_layout(type);
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
                 return a.layout == layout && a.columns == w.input_columns;
