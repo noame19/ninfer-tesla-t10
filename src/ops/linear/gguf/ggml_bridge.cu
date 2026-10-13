@@ -241,8 +241,7 @@ VecArgs vector_args(const void* weight, std::int64_t row_bytes, int rows, int k,
                    k,
                    reinterpret_cast<const std::int8_t*>(base),
                    reinterpret_cast<const half2*>(base + vec_scales_offset(k, columns)),
-                   out,
-                   /*staged=*/0};
+                   out};
 }
 
 constexpr int kMatrixQuantizeThreads = 128;

@@ -13,8 +13,6 @@
 #include "../../common/fixed_point.cuh"
 
 #include <algorithm>
-#include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
@@ -35,8 +33,7 @@ inline constexpr int kVecWarps = 4;
 // that say whether this kernel's grid already offers every block an SM can hold. It changes no
 // launch argument, so a build without it measures the product exactly.
 struct VecSweep {
-    bool diag  = false;
-    bool stage = false;
+    bool diag = false;
 };
 
 inline const VecSweep& vec_sweep() {
@@ -44,10 +41,6 @@ inline const VecSweep& vec_sweep() {
         const char* value = std::getenv("NINFER_GGUF_VEC_DIAG");
         VecSweep out;
         out.diag = value != nullptr && *value != '\0';
-        // NINFER_GGUF_VEC_STAGE=1 stages each pass's weight bytes through shared memory with
-        // aligned 16-byte loads; unset or 0 keeps the direct per-field global loads.
-        const char* staging = std::getenv("NINFER_GGUF_VEC_STAGE");
-        out.stage           = staging != nullptr && *staging != '\0' && *staging != '0';
         return out;
     }();
     return values;
@@ -640,25 +633,13 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
-//
-// p.staged: the warp first copies the weight bytes it is about to decode into shared memory with
-// aligned 16-byte loads, so its global traffic is a coalesced stream instead of the scattered
-// per-field reads the decoders make (which use about half of each 32-byte sector here). The bytes
-// and the offsets they are decoded at are unchanged, so every product is bit for bit the direct
-// form's; only the way the bytes are brought in differs. The launcher passes the shared memory.
 template <ggml_type type, int T, bool Fused, int KS>
 __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
-    using D                    = Decoder<type>;
-    constexpr int kTable       = D::kTableWords > 0 ? D::kTableWords : 4;
-    constexpr int kPerBlock    = D::kBlockElems / 32;
-    constexpr int kRows        = 2;
-    // Bytes this warp decodes in one pass: the (32 / kPerBlock) blocks its lanes cover.
-    constexpr int kChunk       = (32 / kPerBlock) * D::kBlockBytes;
-    // One extra vector absorbs where a pass's start sits within its 16-byte vector.
-    constexpr int kStageVecs   = (kChunk + 31) / 16 + 1;
-    constexpr int kStageStride = kStageVecs * 16;
+    using D                 = Decoder<type>;
+    constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
+    constexpr int kPerBlock = D::kBlockElems / 32;
+    constexpr int kRows     = 2;
     __shared__ __align__(16) std::uint32_t table[kTable];
-    extern __shared__ __align__(16) std::uint8_t stage[];
     if constexpr (D::kTableWords > 0) {
         const std::uint32_t* src = D::table();
         for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
@@ -671,10 +652,6 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     const int step   = Fused ? 1 : kRows;
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
     const int sub                  = lane % kPerBlock;
-    const bool staged              = p.staged != 0;
-    std::uint8_t* const warp_stage = stage + std::size_t(warp) * kRows * kStageStride;
-    const std::uint8_t* const tensor_end =
-        p.weight + std::int64_t(p.rows) * (Fused ? 2 : 1) * p.row_bytes;
 
     for (int row0 = (blockIdx.x * kVecWarps + warp) * step; row0 < p.rows;
          row0 += gridDim.x * kVecWarps * step) {
@@ -694,37 +671,6 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
 #pragma unroll
             for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
         }
-        // Copy this pass's weight bytes for every row this warp owns into shared memory with
-        // aligned 16-byte loads, so the warp's global requests are full 32-byte sectors.
-        const auto stage_slice = [&](int it) {
-            std::uint8_t* dst = warp_stage;
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                const std::uint8_t* src = rowp[r] - lane_offset + std::int64_t(it) * kChunk;
-                const auto addr         = reinterpret_cast<std::uintptr_t>(src);
-                const std::uint8_t* aligned =
-                    reinterpret_cast<const std::uint8_t*>(addr & ~std::uintptr_t(15));
-                const auto* gvec = reinterpret_cast<const uint4*>(aligned);
-                auto* vec        = reinterpret_cast<uint4*>(dst);
-                for (int v = lane; v < kStageVecs; v += 32) {
-                    const std::uint8_t* vp = aligned + std::size_t(v) * 16;
-                    const std::uint8_t* lo = vp > p.weight ? vp : p.weight;
-                    const std::uint8_t* hi = vp + 16 < tensor_end ? vp + 16 : tensor_end;
-                    uint4 value            = make_uint4(0, 0, 0, 0);
-                    if (lo == vp && hi == vp + 16) {
-                        value = gvec[v];
-                    } else if (lo < hi) {
-                        // Only the first or last vector of the tensor can be partial; the bytes
-                        // before `src` are never decoded, so leaving them zero is safe.
-                        std::uint8_t bytes[16] = {};
-                        for (const std::uint8_t* q = lo; q < hi; ++q) { bytes[q - vp] = *q; }
-                        value = *reinterpret_cast<const uint4*>(bytes);
-                    }
-                    vec[v] = value;
-                }
-                dst += kStageStride;
-            }
-        };
         const auto slice = [&](int it) {
             const int s = lane + 32 * it;
             int a[T][8];
@@ -741,33 +687,13 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                const std::uint8_t* bp;
-                if (staged) {
-                    const std::uint8_t* src = rowp[r] - lane_offset + std::int64_t(it) * kChunk;
-                    const int delta =
-                        int(reinterpret_cast<std::uintptr_t>(src) & std::uintptr_t(15));
-                    bp = warp_stage + std::size_t(r) * kStageStride + delta + lane_offset;
-                } else {
-                    bp = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
-                }
                 Slice sl;
-                D::decode(bp, sub, table, sl);
+                D::decode(rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub, table, sl);
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
             }
         };
-        if (staged) {
-            // A warp-uniform loop: every row's pass is copied before any lane reads it, and no pass
-            // overwrites the shared memory before every lane has read it, so the barriers are always
-            // reached by the whole warp.
-            const int passes = (slices + 31) / 32;
-            for (int it = 0; it < passes; ++it) {
-                stage_slice(it);
-                __syncwarp();
-                if (lane + 32 * it < slices) { slice(it); }
-                __syncwarp();
-            }
-        } else if constexpr (KS != 0) {
+        if constexpr (KS != 0) {
             static_assert(KS % 1024 == 0);
 #pragma unroll
             for (int it = 0; it < KS / 1024; ++it) { slice(it); }
@@ -829,11 +755,6 @@ inline void vec_report_once(int rows, int k, int groups, int resident, int block
 
 template <ggml_type type, int T, bool Fused, int KS>
 void launch(const VecArgs& args, cudaStream_t stream) {
-    using D                           = Decoder<type>;
-    constexpr int kPerBlock           = D::kBlockElems / 32;
-    constexpr int kChunk              = (32 / kPerBlock) * D::kBlockBytes;
-    constexpr int kStageVecs          = (kChunk + 31) / 16 + 1;
-    constexpr std::size_t kStageBytes = std::size_t(kVecWarps) * 2 * kStageVecs * 16;
     static const int resident = [] {
         int blocks = 0;
         check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel<type, T, Fused, KS>,
@@ -841,26 +762,14 @@ void launch(const VecArgs& args, cudaStream_t stream) {
               "vector occupancy");
         return std::max(blocks, 1);
     }();
-    static const int resident_staged = [] {
-        int blocks = 0;
-        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel<type, T, Fused, KS>,
-                                                            kVecWarps * 32, kStageBytes),
-              "vector occupancy (staged)");
-        return std::max(blocks, 1);
-    }();
-    const bool staged = vec_sweep().stage;
-    VecArgs launched  = args;
-    launched.staged   = staged ? 1 : 0;
     const int per_block = kVecWarps * (Fused ? 1 : 2);
     const int groups    = (args.rows + per_block - 1) / per_block;
-    const int held      = staged ? resident_staged : resident;
-    const int blocks    = std::min(groups, held * device_facts().sm_count);
+    const int blocks    = std::min(groups, resident * device_facts().sm_count);
     if (vec_sweep().diag) {
-        vec_report_once<type, T, Fused, KS>(args.rows, KS != 0 ? KS : args.k, groups, held, blocks,
-                                            device_facts().sm_count);
+        vec_report_once<type, T, Fused, KS>(args.rows, KS != 0 ? KS : args.k, groups, resident,
+                                            blocks, device_facts().sm_count);
     }
-    kernel<type, T, Fused, KS>
-        <<<blocks, kVecWarps * 32, staged ? kStageBytes : 0, stream>>>(launched);
+    kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args);
     check(cudaGetLastError(), "vector product launch");
 }
 
