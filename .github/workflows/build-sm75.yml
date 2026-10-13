@@ -101,7 +101,7 @@ jobs:
               # server it explains come from one commit.
               scripts/build-native.sh configure
               cmake --build "$NINFER_BUILD_DIR" \
-                --target ninfer-serve ninfer_bench ninfer_benches ninfer-hbm-bandwidth-probe \
+                --target ninfer-serve ninfer-perplexity ninfer_bench ninfer_benches ninfer-hbm-bandwidth-probe \
                 --parallel "$NINFER_JOBS" -- -k 0
               ccache --show-stats
             ' 2>&1 | tee build-sm75.log
@@ -138,14 +138,17 @@ jobs:
       - name: Stage binaries
         if: always()
         run: |
-          mkdir -p dist dist-bench
+          mkdir -p dist dist-bench dist-tools
           if [ -e build-sm75/apps/ninfer-serve ]; then
             cp -a build-sm75/apps/ninfer-serve dist/
+          fi
+          if [ -e build-sm75/apps/ninfer-perplexity ]; then
+            cp -a build-sm75/apps/ninfer-perplexity dist-tools/
           fi
           for p in bench/ninfer_bench bench/ninfer_benches tools/ninfer-hbm-bandwidth-probe; do
             if [ -e "build-sm75/$p" ]; then cp -a "build-sm75/$p" dist-bench/; fi
           done
-          ls -la dist dist-bench || true
+          ls -la dist dist-bench dist-tools || true
 
       - name: Upload binaries
         if: always()
@@ -162,6 +165,15 @@ jobs:
         with:
           name: ninfer-sm75-bench
           path: dist-bench/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload tools
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-sm75-tools
+          path: dist-tools/
           if-no-files-found: warn
           retention-days: 14
 
