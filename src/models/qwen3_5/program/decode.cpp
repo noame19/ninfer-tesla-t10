@@ -48,7 +48,6 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
-        Tensor sample_positions   = ordinary.sample_positions.slice(0, 0, batch_size);
         Tensor rope_positions     = ordinary.rope_positions.slice(0, 0, batch_size);
         Tensor kv_rows            = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor state_sources      = ordinary.state_source_slots.slice(0, 0, batch_size);
@@ -66,7 +65,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                         ordinary.sampling, nullptr);
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
-                    ordinary.sampling, sample_positions, ops::kSamplePurposeDecode,
+                    ordinary.sampling, ordinary.logical_frontiers.slice(0, 0, batch_size), ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
@@ -503,7 +502,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
-                checked_i32(frontier, "ordinary batch position");
+                checked_i32(compact_position(sequence, frontier), "ordinary batch position");
             ordinary_host_ingress->logical_frontiers[row] = checked_i32(frontier, "ordinary RNG frontier");
             ordinary_host_ingress->sample_positions[row] =
                 checked_i32(frontier + 1U, "ordinary batch sample position");
