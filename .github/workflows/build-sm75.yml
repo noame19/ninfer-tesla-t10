@@ -10,11 +10,17 @@
 #
 # ccache is carried between runs so an iteration that touches a few translation units recompiles
 # only those instead of the whole tree.
+#
+# **Manually triggered.**  A push to this branch does not build: the converter, its tests and the
+# docs live beside the Engine, and a change to those cannot move a compiled byte, so a push that
+# only touches them would spend a runner for nothing.  Start a build when the C++ changed:
+#
+#     gh workflow run build-sm75.yml --repo noame19/ninfer-tesla-t10 --ref sm75 -f arch=75
+#
+# The KVMem branch carries its own copy of this file and still builds on push.
 name: build-sm75
 
 on:
-  push:
-    branches: [sm75, 'sm75/**']
   workflow_dispatch:
     inputs:
       arch:
