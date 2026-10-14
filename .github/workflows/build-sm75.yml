@@ -14,7 +14,7 @@ name: build-sm75
 
 on:
   push:
-    branches: [sm75, 'sm75/**']
+    branches: [sm75, 'sm75/**', sm75-kvmem-official]
   workflow_dispatch:
     inputs:
       arch:
