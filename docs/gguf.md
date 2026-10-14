@@ -39,6 +39,80 @@ The scales of `IQ2_XXS`, `IQ2_XS`, `IQ2_S` and `IQ3_XXS` are applied in FP32 whe
 vector kernels round an integer rescale, so a decode step's logits can differ from llama.cpp's in the
 last bits; prompts use llama.cpp's own arithmetic.
 
+## Converting any dense Qwen3.5/3.8 release
+
+The block import is not tied to the 27B widths. `qwen35_dense_gguf` (the same recipe every published
+27B GGUF artifact was converted with under its original name `qwen3_8_27b_gguf`) reads the tower's
+geometry from the base checkpoint's resolved text config and then requires the GGUF's own header and
+complete tensor set to agree with it, so one recipe serves every dense release and a file that is not
+the tower its config describes is refused instead of guessed at:
+
+| | hidden | layers | attention | GDN key/value heads | conv | intermediate |
+|---|---:|---:|---|---|---:|---:|
+| Qwen3.8-27B | 5120 | 64 | 24q/4kv | 16/48 | 10240 | 17408 |
+| Qwen3.5-9B | 4096 | 32 | 16q/4kv | 16/32 | 8192 | 12288 |
+| Qwen3.5-4B | 2560 | 32 | 16q/4kv | 16/32 | 8192 | 9216 |
+| Qwen3.5-0.8B | 1024 | 24 | 8q/2kv | 16/16 | 6144 | 3584 |
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/base-config-only \
+  --recipe qwen35_dense_gguf \
+  --source gguf=RELEASE.gguf \
+  --source vision=mmproj-RELEASE.gguf \
+  --components text,vision,mtp \
+  --name my-model \
+  --out models/my-model.ninfer
+```
+
+`--model` supplies only `config.json` and the frontend resources, so the base release's own files are
+enough. Three exporter conventions the geometry decides:
+
+- **The MTP block** is the layer *after* the last one, so it is read from the file's own `nextn`
+tensor rather than assumed to be `blk.64`, which is what lets a 33-block `-mtp` export (32 real
+layers plus the head) import at `blk.32`. `--components ...,mtp` requires the block; a text-only
+conversion of a file that carries one imports the text tower and leaves it in the file.
+- **A tied tower** stores no `output.weight`: llama.cpp's converters drop it and the runtime reads
+the token table. The recipe detects that from the config and aliases the two parameters, so the
+blocks are stored once and the head keeps its own Use.
+- **The GDN gates** (`ssm_alpha`, `ssm_beta`) are BF16 operands of the Engine. Releases in the wild
+store them as BF16, F32, F16, Q8_0 or Q4_K; every stored form is decoded to the values it represents
+before that single cast, so a gate never acquires a second quantization.
+
+### Checking that nothing was lost
+
+`tools.convert.gguf_fidelity` proves the artifact still holds the source's bytes, from the outside:
+it reads the artifact's objects through the container reader and the GGUF's rows straight off the
+mapped file, derives the geometry from the artifact's recorded config, and re-derives every row map
+(identity, the head-interleaved `attn_q` split, the exporter's tiled value-head order) from that
+geometry alone.
+
+```bash
+python3 -m tools.convert.gguf_fidelity --gguf RELEASE.gguf --artifact models/my-model.ninfer
+```
+
+Every row of every `gguf_*` object must match, including the permuted families, whose wrong ordering
+would otherwise still load and still read fluently. Measured on the releases in this repository's
+`local_model/model` tree:
+
+| Artifact | Imported rows | Bytes identical to the source GGUF |
+|---|---:|---:|
+| Swift-1.5-Qwen3.8-27B-UD-Q3_K_XL | 4,460,544 | 13.10 GiB, 100.0000% |
+| QwenPaw-Flash-9B-heretic-MTP-Q4_K_M | 1,969,152 | 5.76 GiB, 100.0000% |
+| Ornith-1.5-9B-uncensored-Q4_K_M | 1,922,048 | 5.61 GiB, 100.0000% |
+| Qwen3.5-4B-Q4_K_M-mtp | 1,415,168 | 2.80 GiB, 100.0000% |
+
+What is *not* byte-identical is the vision tower and the small direct tensors, which take the
+official Vision formats and BF16/FP32 exactly as the 27B artifacts do; `ssm_alpha`/`ssm_beta` are the
+only text values that change, by one BF16 rounding.
+
+### Which towers the Engine serves
+
+Converting is general; **loading is not**. The Engine's dense path still carries the 27B's geometry
+in several places, so of the towers above only a 27B artifact starts today. The 9B, 4B and 0.8B need
+the engine work listed in [remaining sm_75 work](remaining-sm75-work.md#p0--dense-geometries-other-than-the-27b);
+they convert now, and their artifacts are the input that work is validated against.
+
 ## Serving
 
 A converted artifact starts like any other; MTP, DFlash2 and Vision work as with the official

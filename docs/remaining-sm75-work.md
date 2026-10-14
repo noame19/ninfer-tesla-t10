@@ -23,6 +23,76 @@ Two routes were tried and killed, with the evidence in their commit messages —
 
 ---
 
+## P0 — dense geometries other than the 27B
+
+**Goal.** Serve a converted GGUF of any dense Qwen3.5/3.8 tower, not just the 27B. The converter is
+already general: `qwen35_dense_gguf` reads the geometry from the base config, validates the GGUF's
+header and tensor set against it, and stores each block row unchanged, so a 9B, 4B or 0.8B release
+converts today and its stored rows are byte-identical to the source (tools/convert/gguf_fidelity.py;
+see [GGUF block formats](gguf.md#converting-any-dense-qwen35qwen38-release)). **Loading is what is
+still 27B-shaped**, in the places below. Positions are on `sm75`.
+
+| Tower (hidden / layers / attention / GDN heads / conv) |
+|---|
+| 27B: 5120 / 64 / 24q-4kv / 16-48 / 10240 — supported |
+| 9B and 4B: 4096 or 2560 / 32 / **16q-4kv** / 16-32 / 8192 |
+| 0.8B: 1024 / 24 / **8q-2kv** / 16-16 / 6144 — not needed |
+
+### What refuses a load (fix these first, they are validator-only)
+
+1. `src/ops/weight_input.cpp:169-190` — the fused input projection's geometry whitelist. The two
+   branches it accepts (`dense` 27B, `moe`) are the *same structural rule* with different numbers:
+   attention wants `third == q && fourth == k` (gate shaped like the query, value like the key) and
+   GDN wants `k == q && third == fourth` (key like query, z like value). The literals add no
+   information, so generalizing them merges the branches into one rule.
+2. `src/ops/weight_input.cpp:262-266` — `prepare_gdn_gating_proj_weights` takes `{48,5120}` or
+   `{32,2048}`; a 9B/4B is `{32,4096}`/`{32,2560}`. The rows are the GDN value heads.
+3. `src/ops/wrapper/gdn_input_proj.cpp:1305-1309` — `kGgufHidden 5120`, `kGgufQkvRows 10240`,
+   `kGgufZRows 6144`, `kGgufQueryKey 2048`, `kGgufValue 6144` validate every GGUF GDN projection and
+   the conv composition. All five follow from the tensors the Op is handed (`qkv = 2*key + value`,
+   `value = z`), so they can be derived instead of declared.
+
+### What has no kernel or route (the real work)
+
+4. **GDN gating projection** — the largest item. `src/ops/gdn_gating_proj/bf16/` has exactly two
+   instantiations: `Bf16Gdn27Geometry {48,5120,BlockN 128}` and `Bf16Gdn35Geometry {32,2048,BlockN 64}`
+   (`..._gemm_mma.cuh:38-49`), selected by `is_27`/`is_35`
+   (`..._plan.cpp:179-185`) against two closed route tables (`k27Routes`, `k35Routes`) with
+   sm_86 occupancy asserts. A 32-head/4096-hidden or 32-head/2560-hidden tower needs a third
+   geometry struct, the same schedule set instantiated for it, and its own route table. The kernel
+   is templated on the geometry, so this is instantiation plus table work; the route bounds are
+   tuning constants and want the T10's own measurement, not the sm_86 ones.
+5. **Causal attention** — `src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp:51-55`
+   accepts `(query_heads, kv_heads) ∈ {(24,4), (16,2)}` only, against
+   `CausalD256H24Kv4`/`CausalD256H16Kv2` (`geometry.cuh:17-18`). A 9B/4B is `(16,4)`; the
+   `small_t_i8_w*_h16_*` kernels are already instantiated per head count, so this is likely an alias,
+   the whitelist entry and the `SmallTSplitScale` choice — but that scale is a tuning constant, so it
+   needs a measurement rather than a guess.
+6. **MTP** — `src/ops/kernel/mtp_pack.cuh:9-11` hard-codes the 27B's `14336 = 6144+1024+6144+1024`
+   rows for `mtp_split_attn_in_kernel`, so a 4B (10240) or 9B (10240) MTP block would split at the
+   wrong offsets. The four row counts are the block's own attention shapes; pass them in.
+7. **Vision** — the 9B's tower is the 27B's (depth 27, hidden 1152, ffn 4304, 16 heads) except the
+   merger's `projection_dim` 4096 vs 5120, so it may already fit; the 4B's (depth 24, hidden 1024,
+   ffn 4096) and the 0.8B's (depth 12, hidden 768) are new. The vision projections take the official
+   Vision formats, whose plans are shape-literal too, so this needs its own pass.
+
+Already general, no work needed: the GGUF linear/vector/MMQ products (`gguf_project` requires only
+`k % 512 == 0`), the GDN recurrent and chunked routes (`head_map::of` derives the head mapping from
+the operands), the conv split geometry for 9B/4B sizes
+(`CausalConvSplitGeometry::Rows2048x2048x4096` exists), the GDN fold records for `16x32x8192`, and
+embedding — a GGUF artifact applies no Hadamard rotation, so the 5120-wide rotation routes are not
+on this path.
+
+**What "done" looks like.** A converted 9B and a converted 4B start under `ninfer-serve`, run the
+serving smoke test with vision and MTP, and match llama.cpp's own perplexity on the same GGUF within
+that quant level's noise — plus the existing 27B artifacts still starting unchanged. Requires one
+sm_75 build (GitHub Actions; this host has no nvcc) and the T10, so it needs the card free.
+
+**Size.** Moderate to large: two validator generalizations, one kernel-geometry instantiation with
+its route table, one attention geometry, and one kernel parameterization.
+
+---
+
 ## P2b — a register-staged prefill kernel
 
 **Goal.** Replace the int8 MMQ kernel's blocking global→shared tile load with a software-pipelined

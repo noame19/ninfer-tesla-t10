@@ -1,10 +1,18 @@
-"""A Qwen3.5/3.8 dense GGUF kept in its own ggml block formats (GSQ-RCO mixed-precision releases).
+"""A dense Qwen3.5/3.8 GGUF kept in its own ggml block formats (GSQ-RCO mixed-precision releases).
 
-Every text projection, the token table, the output head and the MTP head of an ``-mtp`` build are
-stored as the exporter's own blocks, one ggml type per tensor, so no weight is re-quantised: a row
+The block-quantized main text projections, token table, output head and MTP head of an ``-mtp``
+build are stored as the exporter's own blocks, without re-quantizing these matrices: a row
 of the artifact is byte for byte a row of the GGUF. llama.cpp's Qwen3.5 exporter conventions are
 undone where they touch rows or small tensors: value heads return to the grouped order,
 zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` again.
+The small GDN alpha/beta gates use the runtime's BF16 format; gates stored as F32/F16 words or as
+quantized blocks are decoded to the values they represent before that cast, while gates already
+stored in BF16 retain their exact words.
+
+The geometry is not fixed here. It is read from the base checkpoint's config and checked against
+the GGUF's own header and tensor set (`gguf_geometry.py`), so the same recipe converts every dense
+Qwen3.5/3.8 release -- the 27B widths, the 9B ones, and anything else a config describes -- while
+a GGUF that disagrees with its config is refused instead of guessed at.
 
 ``ssm_out`` is the exception. Its tiled value heads are its input columns, which a row copy cannot
 move without re-quantising, so its Use carries an ``input_columns`` auxiliary: column ``c`` of the
@@ -21,27 +29,34 @@ needs only the base checkpoint's config and tokenizer files.
 
 from __future__ import annotations
 
-from typing import Callable
+from math import prod
 
 import numpy as np
 import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
+from .gguf_geometry import (
+    BLOCKS,
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+    Geometry,
+    Kind,
+    check_header,
+    expected_tensors,
+    geometry_from_config,
+    header_expectations,
+)
 from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
-from .sources.gguf import GGUFFile
+from .sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
+    ATTENTION_HEADS,
     ATTENTION_HEAD_DIM,
-    ATTENTION_KV_ROWS,
-    ATTENTION_QUERY_ROWS,
-    GDN_CHANNELS,
     GDN_HEAD_DIM,
-    GDN_KEY_DIM,
     GDN_KEY_HEADS,
     GDN_TAPS,
-    GDN_VALUE_DIM,
     GDN_VALUE_HEADS,
     HIDDEN,
     INTERMEDIATE,
@@ -51,110 +66,109 @@ from .ternary import (
     _direct,
     _flat,
     _norm,
-    attention_rows,
     full_attention,
     rows,
-    untile,
-    untiled_rows,
 )
 
-MTP_BLOCK = LAYERS
-# The storage the GDN controls may have (gdn_control_source).
-GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+# The geometry every default argument below uses, and the one the Base 27B artifacts were built
+# with: one place to read, and the ternary and Flash-Next recipes keep their signatures.
+QWEN38_27B_DENSE = Geometry(
+    hidden=HIDDEN,
+    intermediate=INTERMEDIATE,
+    vocabulary=VOCABULARY,
+    layers=LAYERS,
+    attention_heads=ATTENTION_HEADS,
+    attention_head_dim=ATTENTION_HEAD_DIM,
+    kv_heads=4,
+    gdn_key_heads=GDN_KEY_HEADS,
+    gdn_value_heads=GDN_VALUE_HEADS,
+    gdn_head_dim=GDN_HEAD_DIM,
+    taps=GDN_TAPS,
+    layer_types=tuple(
+        FULL_ATTENTION if full_attention(layer) else LINEAR_ATTENTION
+        for layer in range(LAYERS)
+    ),
+)
 
-EXPECTED_HEADER = {
-    "general.architecture": "qwen35",
-    "qwen35.embedding_length": HIDDEN,
-    "qwen35.feed_forward_length": INTERMEDIATE,
-    "qwen35.attention.head_count": 24,
-    "qwen35.attention.head_count_kv": 4,
-    "qwen35.attention.key_length": ATTENTION_HEAD_DIM,
-    "qwen35.attention.value_length": ATTENTION_HEAD_DIM,
-    "qwen35.ssm.conv_kernel": GDN_TAPS,
-    "qwen35.ssm.state_size": GDN_HEAD_DIM,
-    "qwen35.ssm.group_count": GDN_KEY_HEADS,
-    "qwen35.ssm.time_step_rank": GDN_VALUE_HEADS,
-    "qwen35.ssm.inner_size": GDN_VALUE_DIM,
-    "qwen35.full_attention_interval": 4,
-}
-
-
-def _attention_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
-    return {
-        prefix + "attn_q.weight": ((2 * ATTENTION_QUERY_ROWS, HIDDEN), "blocks"),
-        prefix + "attn_k.weight": ((ATTENTION_KV_ROWS, HIDDEN), "blocks"),
-        prefix + "attn_v.weight": ((ATTENTION_KV_ROWS, HIDDEN), "blocks"),
-        prefix + "attn_output.weight": ((HIDDEN, ATTENTION_QUERY_ROWS), "blocks"),
-        prefix + "attn_q_norm.weight": ((ATTENTION_HEAD_DIM,), "F32"),
-        prefix + "attn_k_norm.weight": ((ATTENTION_HEAD_DIM,), "F32"),
-    }
+EXPECTED_HEADER = header_expectations(QWEN38_27B_DENSE)
 
 
-def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
-    return {
-        prefix + "attn_norm.weight": ((HIDDEN,), "F32"),
-        prefix + "post_attention_norm.weight": ((HIDDEN,), "F32"),
-        prefix + "ffn_gate.weight": ((INTERMEDIATE, HIDDEN), "blocks"),
-        prefix + "ffn_up.weight": ((INTERMEDIATE, HIDDEN), "blocks"),
-        prefix + "ffn_down.weight": ((HIDDEN, INTERMEDIATE), "blocks"),
-    }
+def tiled_to_grouped_permutation(geometry: Geometry) -> np.ndarray:
+    """For grouped value head `h = k * per_key + r`, the exporter's tiled position `r * K + k`.
+
+    llama.cpp's exporter stores value heads tiled so that a plain repeat broadcasts the key
+    heads; NInfer pairs value head `h` with key head `h // per_key` and wants the grouped order.
+    """
+
+    heads = np.arange(geometry.gdn_value_heads)
+    per_key = geometry.gdn_value_heads_per_key
+    return (heads % per_key) * geometry.gdn_key_heads + heads // per_key
 
 
-def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
-    """Row-major shape and kind of every tensor: "blocks" (any stored ggml block type) or the
-    ggml type names it may have."""
+def untile(array: np.ndarray, head_dim: int, geometry: Geometry) -> np.ndarray:
+    """Reorder axis 0 from the exporter's tiled value-head order back to grouped."""
 
-    out = {
-        "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
-        "output.weight": ((VOCABULARY, HIDDEN), "blocks"),
-        "output_norm.weight": ((HIDDEN,), "F32"),
-    }
-    for layer in range(LAYERS):
-        p = f"blk.{layer}."
-        out |= _layer_tensors(p)
-        if full_attention(layer):
-            out |= _attention_tensors(p)
-            continue
-        out |= {
-            p + "attn_qkv.weight": ((GDN_CHANNELS, HIDDEN), "blocks"),
-            p + "attn_gate.weight": ((GDN_VALUE_DIM, HIDDEN), "blocks"),
-            p + "ssm_out.weight": ((HIDDEN, GDN_VALUE_DIM), "blocks"),
-            p + "ssm_alpha.weight": ((GDN_VALUE_HEADS, HIDDEN), GDN_CONTROL_TYPES),
-            p + "ssm_beta.weight": ((GDN_VALUE_HEADS, HIDDEN), GDN_CONTROL_TYPES),
-            p + "ssm_a": ((GDN_VALUE_HEADS,), "F32"),
-            p + "ssm_dt.bias": ((GDN_VALUE_HEADS,), "F32"),
-            p + "ssm_conv1d.weight": ((GDN_CHANNELS, GDN_TAPS), "F32"),
-            p + "ssm_norm.weight": ((GDN_HEAD_DIM,), "F32"),
-        }
-    if mtp:
-        p = f"blk.{MTP_BLOCK}."
-        out |= _layer_tensors(p) | _attention_tensors(p)
-        out |= {
-            p + "nextn.eh_proj.weight": ((HIDDEN, 2 * HIDDEN), "blocks"),
-            p + "nextn.enorm.weight": ((HIDDEN,), "F32"),
-            p + "nextn.hnorm.weight": ((HIDDEN,), "F32"),
-            p + "nextn.shared_head_norm.weight": ((HIDDEN,), "F32"),
-        }
-    return out
+    expected = geometry.gdn_value_heads * head_dim
+    if array.shape[0] != expected:
+        raise ValueError(f"axis 0 has {array.shape[0]} entries, expected {expected}")
+    view = array.reshape(geometry.gdn_value_heads, head_dim, *array.shape[1:])
+    return np.ascontiguousarray(
+        view[tiled_to_grouped_permutation(geometry)].reshape(array.shape)
+    )
 
 
-def has_mtp(gguf: GGUFFile) -> bool:
-    return f"blk.{MTP_BLOCK}.nextn.eh_proj.weight" in gguf.tensors
+def attention_rows(gate: bool, geometry: Geometry) -> RowMap:
+    """The query (or output gate) rows of the head-interleaved `attn_q`."""
+
+    d = geometry.attention_head_dim
+
+    def select(begin: int, end: int) -> np.ndarray:
+        r = np.arange(begin, end, dtype=np.int64)
+        return (r // d) * 2 * d + (d if gate else 0) + r % d
+
+    return select
 
 
-def validate(gguf: GGUFFile) -> None:
-    """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types."""
+def untiled_rows(base: int, geometry: Geometry) -> RowMap:
+    """Grouped value-head rows of a tiled family starting at source row `base`."""
 
-    for key, expected in EXPECTED_HEADER.items():
-        if gguf.kv.get(key) != expected:
-            raise ValueError(
-                f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}"
-            )
-    mtp = has_mtp(gguf)
-    blocks = gguf.kv.get("qwen35.block_count")
-    if blocks != LAYERS + (1 if mtp else 0):
-        raise ValueError(f"{gguf.path}: {blocks} blocks, expected {LAYERS} (+1 for MTP)")
-    expected = expected_tensors(mtp)
+    permutation = tiled_to_grouped_permutation(geometry)
+    head_dim = geometry.gdn_head_dim
+
+    def select(begin: int, end: int) -> np.ndarray:
+        r = np.arange(begin, end, dtype=np.int64)
+        return base + permutation[r // head_dim] * head_dim + r % head_dim
+
+    return select
+
+
+def _accepts(info, kind: Kind) -> bool:
+    """Whether a stored tensor's ggml type satisfies one expected kind."""
+
+    for entry in (kind,) if isinstance(kind, str) else kind:
+        if entry == BLOCKS:
+            if info.type_id in GGUF_FORMATS_BY_TYPE:
+                return True
+        elif info.type_name == entry:
+            return True
+    return False
+
+
+def has_mtp(gguf: GGUFFile, geometry: Geometry = QWEN38_27B_DENSE) -> bool:
+    return f"blk.{geometry.mtp_block}.nextn.eh_proj.weight" in gguf.tensors
+
+
+def validate(gguf: GGUFFile, geometry: Geometry = QWEN38_27B_DENSE) -> Geometry:
+    """Refuse any GGUF that is not this dense Qwen3.5/3.8 text tower of stored block types.
+
+    `geometry` is the tower the base checkpoint describes. Whether the file carries the exporter's
+    next-token-prediction block is the file's own answer, so it is read here rather than assumed;
+    the returned Geometry is the file as it actually is, MTP block included.
+    """
+
+    full = geometry.with_mtp(has_mtp(gguf, geometry))
+    check_header(gguf.kv, full, source=str(gguf.path))
+    expected = expected_tensors(full)
     if set(gguf.tensors) != set(expected):
         missing = sorted(set(expected) - set(gguf.tensors))[:5]
         extra = sorted(set(gguf.tensors) - set(expected))[:5]
@@ -163,15 +177,12 @@ def validate(gguf: GGUFFile) -> None:
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if kind == "blocks":
-            accepted = info.type_id in GGUF_FORMATS_BY_TYPE
-        else:
-            accepted = info.type_name in ((kind,) if isinstance(kind, str) else kind)
-        if info.shape != shape or not accepted:
+        if info.shape != shape or not _accepts(info, kind):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
         raise ValueError(f"{gguf.path}: the data section is truncated")
+    return full
 
 
 def block_format(gguf: GGUFFile, tensor: str) -> str:
@@ -244,6 +255,21 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
     )
 
 
+def _values(gguf: GGUFFile, tensor: str) -> np.ndarray:
+    """Every value of a stored tensor as float32 words, direct formats and blocks alike.
+
+    The GDN gates are the only tensors this serves: a quantized gate decodes to the values it
+    represents, which is what the Engine's BF16 operand needs.
+    """
+
+    info = gguf.info(tensor)
+    if info.type_id in (TYPE_F32, TYPE_F16, TYPE_BF16):
+        return gguf.read_direct(tensor)
+    rows = prod(info.shape[:-1])
+    decoded = _dequantize(gguf, tensor, 0, rows).numpy()
+    return np.ascontiguousarray(decoded.reshape(info.shape))
+
+
 def block_source(
     gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
 ) -> LogicalSource:
@@ -270,19 +296,25 @@ def block_source(
     )
 
 
-def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
-    """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
-    as stored, Q8_0 values rounded to BF16."""
+def gdn_control_source(
+    gguf: GGUFFile, tensor: str, geometry: Geometry = QWEN38_27B_DENSE
+) -> LogicalSource:
+    """A GDN A/B control as its BF16 operand, its value heads in the grouped order.
 
-    if gguf.info(tensor).type_id == GGML_Q8_0:
-        values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
+    BF16 words are stored exactly as they are. Every other storage an exporter may choose --
+    F32/F16 words, or Q8_0 and the other block types -- decodes to the values it represents
+    before the BF16 cast, so the operand does not acquire a second quantization.
+    """
+
+    if gguf.info(tensor).type_id == TYPE_BF16:
+        words = untile(gguf.read_bf16_words(tensor), 1, geometry)
         return array_source(
-            torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
+            torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(torch.bfloat16),
+            tensor,
         )
-    words = untile(gguf.read_bf16_words(tensor), 1)
+    values = untile(_values(gguf, tensor), 1, geometry)
     return array_source(
-        torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(torch.bfloat16),
-        tensor,
+        torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
     )
 
 
@@ -358,27 +390,37 @@ def q8_native_source(
                          raw_source.read_values, encoded)
 
 
-def tiled_input_columns() -> np.ndarray:
+def tiled_input_columns(geometry: Geometry = QWEN38_27B_DENSE) -> np.ndarray:
     """For each stored ``ssm_out`` column (tiled value heads), its grouped activation element."""
 
-    columns = np.arange(GDN_VALUE_DIM, dtype=np.int64)
-    tiled_head, lane = columns // GDN_HEAD_DIM, columns % GDN_HEAD_DIM
-    per_key = GDN_VALUE_HEADS // GDN_KEY_HEADS
-    grouped_head = (tiled_head % GDN_KEY_HEADS) * per_key + tiled_head // GDN_KEY_HEADS
-    return (grouped_head * GDN_HEAD_DIM + lane).astype(np.int32)
+    head_dim = geometry.gdn_head_dim
+    columns = np.arange(geometry.gdn_value_dim, dtype=np.int64)
+    tiled_head, lane = columns // head_dim, columns % head_dim
+    per_key = geometry.gdn_value_heads_per_key
+    grouped_head = (
+        (tiled_head % geometry.gdn_key_heads) * per_key
+        + tiled_head // geometry.gdn_key_heads
+    )
+    return (grouped_head * head_dim + lane).astype(np.int32)
 
 
 def _attention(
-    gguf: GGUFFile, g: str, a: str
+    gguf: GGUFFile, g: str, a: str, geometry: Geometry
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
-    q_shape, kv_shape = (ATTENTION_QUERY_ROWS, HIDDEN), (ATTENTION_KV_ROWS, HIDDEN)
+    hidden = geometry.hidden
+    query_rows = geometry.attention_query_rows
+    q_shape, kv_shape = (query_rows, hidden), (geometry.attention_kv_rows, hidden)
     encoded = {
-        a + "query": block_source(gguf, g + "attn_q.weight", q_shape, attention_rows(False)),
-        a + "gate": block_source(gguf, g + "attn_q.weight", q_shape, attention_rows(True)),
+        a + "query": block_source(
+            gguf, g + "attn_q.weight", q_shape, attention_rows(False, geometry)
+        ),
+        a + "gate": block_source(
+            gguf, g + "attn_q.weight", q_shape, attention_rows(True, geometry)
+        ),
         a + "key": block_source(gguf, g + "attn_k.weight", kv_shape, rows()),
         a + "value": block_source(gguf, g + "attn_v.weight", kv_shape, rows()),
         a + "output": block_source(
-            gguf, g + "attn_output.weight", (HIDDEN, ATTENTION_QUERY_ROWS), rows()
+            gguf, g + "attn_output.weight", (hidden, query_rows), rows()
         ),
     }
     direct = {
@@ -389,13 +431,16 @@ def _attention(
 
 
 def _layer(
-    gguf: GGUFFile, g: str, p: str
+    gguf: GGUFFile, g: str, p: str, geometry: Geometry
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+    hidden, intermediate = geometry.hidden, geometry.intermediate
     encoded = {
-        p + "mlp/gate": block_source(gguf, g + "ffn_gate.weight", (INTERMEDIATE, HIDDEN), rows()),
-        p + "mlp/up": block_source(gguf, g + "ffn_up.weight", (INTERMEDIATE, HIDDEN), rows()),
+        p + "mlp/gate": block_source(
+            gguf, g + "ffn_gate.weight", (intermediate, hidden), rows()
+        ),
+        p + "mlp/up": block_source(gguf, g + "ffn_up.weight", (intermediate, hidden), rows()),
         p + "mlp/down": block_source(
-            gguf, g + "ffn_down.weight", (HIDDEN, INTERMEDIATE), rows()
+            gguf, g + "ffn_down.weight", (hidden, intermediate), rows()
         ),
     }
     direct = {
@@ -406,77 +451,115 @@ def _layer(
 
 
 def text_sources(
-    gguf: GGUFFile, *, mtp: bool
+    gguf: GGUFFile, geometry: Geometry = QWEN38_27B_DENSE
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
     """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter."""
 
+    hidden = geometry.hidden
+    key_dim, value_dim = geometry.gdn_key_dim, geometry.gdn_value_dim
+    # A tied tower has one table for both roles: the exporter stores no `output.weight`, so the
+    # head reads the token table. The recipe shares the two parameters, so the blocks are stored
+    # once.
+    head = "token_embd.weight" if geometry.tied else "output.weight"
     encoded = {
         "text/token_embedding": block_source(
-            gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
+            gguf, "token_embd.weight", (geometry.vocabulary, hidden), rows()
         ),
-        "text/output_head": block_source(gguf, "output.weight", (VOCABULARY, HIDDEN), rows()),
+        "text/output_head": block_source(
+            gguf, head, (geometry.vocabulary, hidden), rows()
+        ),
     }
     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
-    for layer in range(LAYERS):
+    for layer in range(geometry.layers):
         g, p = f"blk.{layer}.", f"text/layers/{layer}/"
-        e, d = _layer(gguf, g, p)
+        e, d = _layer(gguf, g, p, geometry)
         encoded |= e
         direct |= d
-        if full_attention(layer):
-            e, d = _attention(gguf, g, p + "attention/")
+        if geometry.full_attention(layer):
+            e, d = _attention(gguf, g, p + "attention/", geometry)
             encoded |= e
             direct |= d
             continue
         n = p + "gdn/"
         qkv = g + "attn_qkv.weight"
-        encoded[n + "query"] = block_source(gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows())
-        encoded[n + "key"] = block_source(gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows(GDN_KEY_DIM))
+        encoded[n + "query"] = block_source(gguf, qkv, (key_dim, hidden), rows())
+        encoded[n + "key"] = block_source(gguf, qkv, (key_dim, hidden), rows(key_dim))
         encoded[n + "value"] = block_source(
-            gguf, qkv, (GDN_VALUE_DIM, HIDDEN), untiled_rows(2 * GDN_KEY_DIM)
+            gguf, qkv, (value_dim, hidden), untiled_rows(2 * key_dim, geometry)
         )
         encoded[n + "z"] = block_source(
-            gguf, g + "attn_gate.weight", (GDN_VALUE_DIM, HIDDEN), untiled_rows(0)
+            gguf, g + "attn_gate.weight", (value_dim, hidden), untiled_rows(0, geometry)
         )
         # Tiled input columns: the Use gathers the grouped activation (see tiled_input_columns).
         encoded[n + "output"] = block_source(
-            gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
+            gguf, g + "ssm_out.weight", (hidden, value_dim), rows()
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
-            direct[n + role] = gdn_control_source(gguf, g + tensor)
-        ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
+            direct[n + role] = gdn_control_source(gguf, g + tensor, geometry)
+        ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1, geometry).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
         direct[n + "a_log"] = _direct(
             np.log(-ssm_a).astype(np.float32), torch.float32, g + "ssm_a"
         )
         direct[n + "dt_bias"] = _direct(
-            untile(gguf.read_direct(g + "ssm_dt.bias"), 1), torch.float32, g + "ssm_dt.bias"
+            untile(gguf.read_direct(g + "ssm_dt.bias"), 1, geometry),
+            torch.float32,
+            g + "ssm_dt.bias",
         )
         taps = gguf.read_direct(g + "ssm_conv1d.weight")
         channels = np.concatenate(
-            [taps[: 2 * GDN_KEY_DIM], untile(taps[2 * GDN_KEY_DIM :], GDN_HEAD_DIM)]
+            [
+                taps[: 2 * key_dim],
+                untile(taps[2 * key_dim :], geometry.gdn_head_dim, geometry),
+            ]
         )
         direct[n + "convolution"] = _direct(
             channels.T, torch.bfloat16, g + "ssm_conv1d.weight"
         )
         direct[n + "norm"] = _norm(gguf, g + "ssm_norm.weight", False)
-    if mtp:
-        g, p = f"blk.{MTP_BLOCK}.", "mtp/layers/0/"
-        e, d = _layer(gguf, g, p)
-        encoded |= e
-        direct |= d
-        e, d = _attention(gguf, g, p + "attention/")
-        encoded |= e
-        direct |= d
-        encoded["mtp/input_projection"] = block_source(
-            gguf, g + "nextn.eh_proj.weight", (HIDDEN, 2 * HIDDEN), rows()
-        )
-        for role, tensor in (
-            ("embedding_norm", "nextn.enorm.weight"),
-            ("hidden_norm", "nextn.hnorm.weight"),
-            ("final_norm", "nextn.shared_head_norm.weight"),
-        ):
-            direct["mtp/" + role] = _norm(gguf, g + tensor, True)
+    if geometry.mtp:
+        e, d = mtp_sources(gguf, geometry)
+        encoded.update(e)
+        direct.update(d)
+    return encoded, direct
+
+
+def mtp_sources(
+    gguf: GGUFFile, geometry: Geometry = QWEN38_27B_DENSE
+) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+    """The exporter's MTP block, with its zero-centred (+1 stored) norms.
+
+    This is the same MTP schema used by the dense GGUF recipe. A ternary target
+    may use it independently; its main weights need not be GGUF block formats.
+    """
+
+    geometry = geometry.with_mtp(True)
+    required = {
+        name: value
+        for name, value in expected_tensors(geometry).items()
+        if name.startswith(f"blk.{geometry.mtp_block}.")
+    }
+    for name, (shape, kind) in required.items():
+        info = gguf.info(name)
+        if info.shape != shape:
+            raise ValueError(f"{name}: MTP shape {info.shape} differs from {shape}")
+        if kind == BLOCKS:
+            block_format(gguf, name)
+        elif not _accepts(info, ("F32", "F16", "BF16")):
+            raise ValueError(f"{name}: MTP norm must be a direct format")
+    g, p = f"blk.{geometry.mtp_block}.", "mtp/layers/0/"
+    encoded, direct = _layer(gguf, g, p, geometry)
+    e, d = _attention(gguf, g, p + "attention/", geometry)
+    encoded.update(e)
+    direct.update(d)
+    encoded["mtp/input_projection"] = block_source(
+        gguf, g + "nextn.eh_proj.weight", (geometry.hidden, 2 * geometry.hidden), rows()
+    )
+    for role, tensor in (("embedding_norm", "nextn.enorm.weight"),
+                         ("hidden_norm", "nextn.hnorm.weight"),
+                         ("final_norm", "nextn.shared_head_norm.weight")):
+        direct["mtp/" + role] = _norm(gguf, g + tensor, True)
     return encoded, direct
 
 
@@ -552,27 +635,35 @@ def _group_same_format(recipe, names: list[str], formats: dict[str, str]) -> Non
         recipe.group(names)
 
 
-def qwen3_8_27b_gguf(model, recipe, sources):
-    """A Qwen3.8-27B GGUF in its own block formats from `--source gguf=MODEL.gguf`."""
+def qwen35_dense_gguf(model, recipe, sources):
+    """A dense Qwen3.5/3.8 GGUF in its own block formats from `--source gguf=MODEL.gguf`.
+
+    The geometry comes from the base checkpoint's config, so one recipe serves every dense
+    release: the 27B widths, the 9B ones, and whatever else a config describes. The GGUF's own
+    header and tensor set must agree with that geometry. A mixture-of-experts release is refused
+    here; its expert banks are `qwen3_8_flash_next_gguf`'s subject.
+    """
 
     config = model.config
-    if (
-        "num_experts" in config
-        or config["hidden_size"] != HIDDEN
-        or config["num_hidden_layers"] != LAYERS
-    ):
-        raise ValueError("the GGUF block recipe requires the Qwen3.8-27B Dense geometry")
+    if "num_experts" in config:
+        raise ValueError("the dense GGUF block recipe requires Qwen3.5/3.8 Dense mathematics")
     gguf = sources["gguf"]
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's .gguf file")
-    validate(gguf)
-    mtp = "mtp" in model.components
-    if mtp and not has_mtp(gguf):
-        raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
+    # The config gives the widths and the head the checkpoint records; the file's own header and
+    # tensor set then decide whether the tower it holds is that one, MTP block included.
+    geometry = validate(gguf, geometry_from_config(config, mtp=False))
+    if "mtp" in model.components and not geometry.mtp:
+        raise ValueError(
+            f"{gguf.path}: the MTP component needs an -mtp GGUF "
+            f"(blk.{geometry.mtp_block}.nextn.*)"
+        )
     _companions(model, recipe, sources)
-    encoded, direct = text_sources(gguf, mtp=mtp)
+    encoded, direct = text_sources(gguf, geometry)
     formats = {}
     for name, source in encoded.items():
+        if source.read_encoded is None:
+            raise ValueError(f"{name}: the block import needs an encoded reader")
         format = source.read_encoded(0, 1).format
         formats[name] = format
         recipe.assign(
@@ -585,11 +676,16 @@ def qwen3_8_27b_gguf(model, recipe, sources):
             method=cast_direct,
             source=source,
         )
-    prefixes = [f"text/layers/{layer}/" for layer in range(LAYERS)]
-    if mtp:
+    if geometry.tied:
+        # One table, two parameters. The alias has to be declared after both are assigned, because
+        # a physical assignment clears it, and it makes the artifact store the blocks once while
+        # the head keeps its own Use.
+        recipe.share("text/output_head", "text/token_embedding")
+    prefixes = [f"text/layers/{layer}/" for layer in range(geometry.layers)]
+    if geometry.mtp:
         prefixes.append("mtp/layers/0/")
     for p in prefixes:
-        if p.startswith("text/") and not full_attention(int(p.split("/")[2])):
+        if p.startswith("text/") and not geometry.full_attention(int(p.split("/")[2])):
             n = p + "gdn/"
             qkv = [n + "query", n + "key", n + "value"]
             recipe.group(qkv + [n + "z"] if formats[n + "z"] == formats[n + "query"] else qkv)
@@ -601,26 +697,37 @@ def qwen3_8_27b_gguf(model, recipe, sources):
             )
         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
     columns = AuxiliaryValue(
-        "int32", (GDN_VALUE_DIM,), tiled_input_columns().astype("<i4").tobytes()
+        "int32",
+        (geometry.gdn_value_dim,),
+        tiled_input_columns(geometry).astype("<i4").tobytes(),
     )
-    for layer in range(LAYERS):
-        if full_attention(layer):
+    for layer in range(geometry.layers):
+        if geometry.full_attention(layer):
             continue
         name = f"text/layers/{layer}/gdn/output"
         for input_name in model.parameters[name].inputs:
             recipe.use(name, input_name, auxiliaries={"input_columns": columns})
 
 
-RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}
+RECIPES = {
+    "qwen35_dense_gguf": qwen35_dense_gguf,
+    # The name every published 27B GGUF artifact was converted with: the same recipe.
+    "qwen3_8_27b_gguf": qwen35_dense_gguf,
+}
+
+# Kept importable under its original name; the recipe is geometry-general now.
+qwen3_8_27b_gguf = qwen35_dense_gguf
 
 __all__ = [
     "EXPECTED_HEADER",
+    "QWEN38_27B_DENSE",
     "RECIPES",
     "block_format",
     "block_source",
     "expected_tensors",
     "gdn_control_source",
     "has_mtp",
+    "qwen35_dense_gguf",
     "qwen3_8_27b_gguf",
     "q2_native_source",
     "q8_native_source",
