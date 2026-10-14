@@ -254,7 +254,9 @@ function(ninfer_stamp_build_id target)
   target_include_directories(${target} PRIVATE ${CMAKE_BINARY_DIR}/generated)
 endfunction()
 # The portable core is versioned in this same repository.
-get_filename_component(_kvmem_core "${CMAKE_CURRENT_SOURCE_DIR}/../../kvmem" ABSOLUTE)
+# Upstream keeps this as a sibling of the ninfer submodule (backends/ninfer -> ../../kvmem).
+# This tree is the ninfer root itself, so the core is vendored at third_party/kvmem.
+get_filename_component(_kvmem_core "${CMAKE_CURRENT_SOURCE_DIR}/third_party/kvmem" ABSOLUTE)
 set(NINFER_KVMEM_SOURCE_DIR "${_kvmem_core}" CACHE PATH "Portable KVMem core directory")
 if(NOT EXISTS "${NINFER_KVMEM_SOURCE_DIR}/include/kvmem/memory_contract.hpp")
   message(FATAL_ERROR "Set NINFER_KVMEM_SOURCE_DIR to the portable KVMem core")
