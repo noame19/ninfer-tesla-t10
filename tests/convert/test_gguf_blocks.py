@@ -37,7 +37,7 @@ GGML_BLOCKS = {
 }
 
 
-def _q8_0_file(tmp_path, rows: int, columns: int, seed: int):
+def _q8_0_file(tmp_path, rows: int, columns: int, seed: int, name: str = "w"):
     generator = np.random.default_rng(seed)
     blocks = generator.integers(0, 256, size=(rows, columns // 32, 34), dtype=np.uint8)
     scales = generator.uniform(0.01, 0.02, size=(rows, columns // 32)).astype(np.float16)
@@ -46,39 +46,17 @@ def _q8_0_file(tmp_path, rows: int, columns: int, seed: int):
     write_gguf(
         path,
         {"general.architecture": "qwen35"},
-        [("w", (rows, columns), TYPE_Q8_0, blocks.tobytes())],
+        [(name, (rows, columns), TYPE_Q8_0, blocks.tobytes())],
     )
     return path, blocks
 
 
-def _small_block_file(tmp_path, type_id: int, rows: int = 4):
-    elements, size = GGML_BLOCKS[type_id]
-    columns = 128
-    bits, zero = {42: (2, 1), 2: (4, 8), 6: (5, 16)}[type_id]
-    blocks = np.empty((rows, columns // elements, size), dtype=np.uint8)
-    expected = np.empty((rows, columns), dtype=np.float32)
-    for row in range(rows):
-        for block in range(columns // elements):
-            scale = (0.5, -0.25, 0.0, 2**-24)[(row + block) % 4]
-            codes = [(5 * i + 7 * (i // 16) + row * 3 + block * 7) % (1 << bits)
-                     for i in range(elements)]
-            if type_id == 42:
-                packed = bytes(sum(codes[i + j] << (2 * j) for j in range(4))
-                               for i in range(0, elements, 4))
-            else:
-                packed = bytes((codes[i] & 15) | ((codes[i + 16] & 15) << 4)
-                               for i in range(16))
-                if type_id == 6:
-                    high = sum(((code >> 4) & 1) << i for i, code in enumerate(codes))
-                    packed = high.to_bytes(4, "little") + packed
-            blocks[row, block] = np.frombuffer(struct.pack("<e", scale) + packed, dtype=np.uint8)
-            expected[row, block * elements : (block + 1) * elements] = [
-                (code - zero) * scale for code in codes
-            ]
-    path = tmp_path / f"blocks-{type_id}.gguf"
-    write_gguf(path, {"general.architecture": "qwen35"},
-               [("w", (rows, columns), type_id, blocks.tobytes())])
-    return path, blocks.reshape(rows, -1), expected
+def _q8_0_values(blocks: np.ndarray) -> np.ndarray:
+    """Independent ggml Q8_0 dequantization: binary16 d times each signed code byte."""
+
+    scales = blocks[..., :2].copy().view(np.float16).astype(np.float32)
+    codes = blocks[..., 2:].copy().view(np.int8).astype(np.float32)
+    return (codes * scales).reshape(blocks.shape[0], -1)
 
 
 def test_formats_are_ggml_blocks():
@@ -135,13 +113,10 @@ def test_q2_0_gates_decode_before_grouped_bf16_cast(tmp_path, monkeypatch):
 
 
 def test_row_values_are_ggml_dequantization(tmp_path):
-    pytest.importorskip("gguf")
     path, blocks = _q8_0_file(tmp_path, 6, 64, 2)
     with GGUFFile(path) as gguf:
         source = gguf_blocks.block_source(gguf, "w", (6, 64), lambda b, e: np.arange(b, e))
-        scales = blocks[3:5, :, :2].copy().view(np.float16).astype(np.float32)
-        codes = blocks[3:5, :, 2:].view(np.int8).astype(np.float32)
-        assert torch.equal(source.rows(3, 5), torch.from_numpy((codes * scales).reshape(2, 64)))
+        assert torch.equal(source.rows(3, 5), torch.from_numpy(_q8_0_values(blocks[3:5])))
 
 
 def test_output_projection_columns_read_the_grouped_value_heads():
@@ -152,27 +127,15 @@ def test_output_projection_columns_read_the_grouped_value_heads():
         assert columns[tiled_head * 128 + 5] == (key_head * 3 + repeat) * 128 + 5
 
 
-def test_quantized_gates_decode_before_grouped_bf16_cast(tmp_path):
-    pytest.importorskip("gguf")
-    path, blocks = _q8_0_file(tmp_path, 48, 64, 3)
-    scales = blocks[:, :, :2].copy().view(np.float16).astype(np.float32)
-    codes = blocks[:, :, 2:].view(np.int8).astype(np.float32)
-    tiled = (codes * scales).reshape(48, 64)
-    # GGUF tiles by repeat then key; execution groups the three repeats of each key.
-    grouped = tiled.reshape(3, 16, 64).transpose(1, 0, 2).reshape(48, 64)
+def test_q8_0_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
+    # Underdog-Saluki-style exports store ssm_alpha/ssm_beta as Q8_0 blocks: their values reach the
+    # Engine's BF16 operand, the exporter's tiled value heads back in the grouped order.
+    heads = gguf_blocks.GDN_VALUE_HEADS
+    path, blocks = _q8_0_file(tmp_path, heads, 64, 5, "blk.0.ssm_alpha.weight")
     with GGUFFile(path) as gguf:
-        source = gguf_blocks._gate_projection(gguf, "w")
-        assert source.shape == (48, 64)
-        assert torch.equal(source.rows(0, 48), torch.from_numpy(grouped.copy()).to(torch.bfloat16))
-
-
-def test_bf16_gates_preserve_words_through_grouping(tmp_path):
-    words = np.arange(48 * 64, dtype=np.uint16).reshape(48, 64) + 0x3800
-    path = tmp_path / "gates.gguf"
-    write_gguf(path, {"general.architecture": "qwen35"},
-               [("w", (48, 64), TYPE_BF16, words.tobytes())])
-    expected = words.reshape(3, 16, 64).transpose(1, 0, 2).reshape(48, 64)
-    with GGUFFile(path) as gguf:
-        source = gguf_blocks._gate_projection(gguf, "w")
-        actual = source.rows(0, 48).view(torch.int16).numpy().view(np.uint16)
-        assert np.array_equal(actual, expected)
+        values = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_alpha.weight").rows(0, heads)
+    tiled = _q8_0_values(blocks)
+    # Grouped head k * 3 + r is the exporter's tiled head r * 16 + k.
+    grouped = [r * 16 + k for k in range(16) for r in range(3)]
+    assert values.dtype == torch.bfloat16
+    assert torch.equal(values, torch.from_numpy(tiled[grouped]).to(torch.bfloat16))

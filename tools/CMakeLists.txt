@@ -34,3 +34,12 @@ target_link_libraries(ninfer-w4-row-scale-error PRIVATE ninfer_artifact)
 ninfer_internal_includes(ninfer-w4-row-scale-error)
 set_target_properties(ninfer-w4-row-scale-error PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+# Standalone sustained device-memory bandwidth probe. It measures the pure-read and copy ceilings
+# of the machine, independently of any Op, so an Op's measured GB/s has a denominator that was
+# measured on the same card rather than taken from a specification. Uploaded and run on the target
+# machine like the probes above; it links only the CUDA runtime.
+add_executable(ninfer-hbm-bandwidth-probe hbm_bandwidth_probe.cu)
+set_target_properties(ninfer-hbm-bandwidth-probe PROPERTIES
+  CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")

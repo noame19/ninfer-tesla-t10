@@ -114,6 +114,13 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         scheduler_.allow_concurrent_prefill(options.concurrent_prefill);
+        // 0 selects prefill_chunk / 64, which keeps decode's share of GPU time about the same at
+        // any chunk size.
+        scheduler_.configure_decode_rounds(
+            options.decode_rounds_per_prefill != 0
+                ? options.decode_rounds_per_prefill
+                : std::clamp<std::uint32_t>(options.prefill_chunk / 64, 1, 4096),
+            std::max<std::uint32_t>(options.prefill_chunk, 1));
         if (!options.context_cache.max_private_continuations ||
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
@@ -1572,7 +1579,13 @@ private:
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
-            if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
+            if (scheduler_.owns_prefill_lane(lane)) {
+                ++cumulative_stats_.cancelled_prefills;
+                cumulative_stats_.cancelled_prefill_computed_tokens +=
+                    request->computed_prompt_tokens;
+                if (aborted.salvaged) { ++cumulative_stats_.cancelled_prefills_salvaged; }
+                scheduler_.clear_prefill_lane(lane);
+            }
             append_output(request, commit_output(*request));
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             // Free the slot and publish the post-release snapshot before waking the caller so
@@ -1604,8 +1617,19 @@ private:
             }
             have_pending = !pending_.empty();
         }
-        for (const auto& request : cancelled) { scheduler_.on_waiting_removed(request->id); }
-        for (const auto& request : expired) { scheduler_.on_waiting_removed(request->id); }
+        const auto removed = Clock::now();
+        for (const auto& request : cancelled) {
+            ++cumulative_stats_.waiting_cancelled_requests;
+            cumulative_stats_.waiting_abandoned_seconds +=
+                std::chrono::duration<double>(removed - request->submitted).count();
+            scheduler_.on_waiting_removed(request->id);
+        }
+        for (const auto& request : expired) {
+            ++cumulative_stats_.waiting_expired_requests;
+            cumulative_stats_.waiting_abandoned_seconds +=
+                std::chrono::duration<double>(removed - request->submitted).count();
+            scheduler_.on_waiting_removed(request->id);
+        }
         try {
             for (const auto& request : cancelled) { complete_detached_cancelled(request); }
             for (const auto& request : expired) {
@@ -2006,15 +2030,29 @@ private:
 
     // The lowest lane owning staged prefill that can advance now. A lane offering an active
     // capture, or whose media item still encodes in a concurrent overlay window, yields its unit.
+    // The prompt tokens a staged-prefill lane has left to compute.
+    [[nodiscard]] std::uint32_t remaining_prompt(std::uint32_t lane) const {
+        const auto& request = slots_[lane];
+        if (request == nullptr || !request->admitted_begin) { return 0U; }
+        const BeginSummary& begin    = *request->admitted_begin;
+        const std::uint64_t computed =
+            std::uint64_t(begin.reused_prompt_tokens) + request->computed_prompt_tokens;
+        return static_cast<std::uint32_t>(
+            begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U);
+    }
+
     [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
-        return scheduler_.select_runnable_prefill_lane(max_concurrency_, [&](std::uint32_t lane) {
-            const auto& request = slots_[lane];
-            if constexpr (requires { instance_.program->memory_pending(*request->sequence); }) {
-                if (request && request->sequence && instance_.program->memory_pending(*request->sequence)) return false;
-            }
-            return request != nullptr && !request->storage_failure && !request->storage_cancelling && request->is_prefilling() && !request->capture_pending &&
-                   !(request->sequence && instance_.program->vision_pending(*request->sequence));
-        });
+        return scheduler_.select_runnable_prefill_lane(
+            max_concurrency_, [&](std::uint32_t lane) -> std::optional<std::uint32_t> {
+                const auto& request = slots_[lane];
+                if (request == nullptr || request->storage_failure || request->storage_cancelling ||
+                    (request->sequence && instance_.program->memory_pending(*request->sequence)) ||
+                    !request->is_prefilling() || request->capture_pending ||
+                    (request->sequence && instance_.program->vision_pending(*request->sequence))) {
+                    return std::nullopt;
+                }
+                return remaining_prompt(lane);
+            });
     }
 
     void fail_storage_request(std::uint32_t lane, const std::exception_ptr& error) {
@@ -2034,6 +2072,7 @@ private:
         if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        scheduler_.record_prefill_unit(lane);
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
@@ -2985,6 +3024,8 @@ private:
         core::ResidentMemoryBinding resident_binding(residency);
         Clock::time_point last_residency_check{};
         bool previous_unit_was_decode = false;
+        // Decode and control units executed since the last prefill unit; saturates.
+        std::uint32_t decode_run = 0;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -3070,8 +3111,7 @@ private:
                 if (skip_admission) { --oom_backoff_; }
                 if (!skip_admission &&
                     scheduler_.should_attempt_admission(
-                        have_pending, admission_check_pending, !membership.empty(),
-                        previous_unit_was_decode,
+                        have_pending, admission_check_pending, !membership.empty(), decode_run,
                         instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
                     if (residency) { residency->check("request admission"); }
@@ -3116,7 +3156,7 @@ private:
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
-                    previous_unit_was_decode = true;
+                    decode_run += decode_run != std::numeric_limits<std::uint32_t>::max();
                     oom_recovery_count_ = 0;
                     continue;
                 }
@@ -3148,14 +3188,15 @@ private:
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
                 }
-                const bool prefill_runnable = runnable_prefill_lane().has_value();
+                const std::optional<std::uint32_t> next_lane = runnable_prefill_lane();
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                    !membership.empty(), next_lane.has_value(), decode_run,
+                    next_lane ? remaining_prompt(*next_lane) : 0U);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
-                    previous_unit_was_decode = false;
+                    decode_run = 0;
                     oom_recovery_count_ = 0;
                     continue;
                 }
@@ -3163,7 +3204,7 @@ private:
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
-                    previous_unit_was_decode = true;
+                    decode_run += decode_run != std::numeric_limits<std::uint32_t>::max();
                     oom_recovery_count_ = 0;
                     continue;
                 }
@@ -3220,7 +3261,7 @@ private:
                 oom_backoff_ = kOomBackoffIterations;
                 // Scheduler state was cleared by recover_from_oom_locked; treat the next
                 // iteration as a fresh scheduling boundary (no decode continuity).
-                previous_unit_was_decode = false;
+                decode_run = 0;
                 continue;
             } catch (const std::logic_error& invariant) {
                 if (!recover_invariant_failures_) {
@@ -3243,8 +3284,8 @@ private:
                     return;
                 }
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
-                oom_backoff_             = kOomBackoffIterations;
-                previous_unit_was_decode = false;
+                oom_backoff_ = kOomBackoffIterations;
+                decode_run   = 0;
                 continue;
             } catch (...) {
                 crash_locked(std::current_exception());

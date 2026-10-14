@@ -250,8 +250,9 @@ void validate_compatibility_hints(const Json& body) {
     }
 }
 
+// `image` receives an image's detail; a video has none.
 ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field,
-                                                       bool image) {
+                                                       ContentPart* image) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -265,7 +266,15 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
             bad_request(std::string(field) + " must contain a string url", "messages");
         }
         url = value.at("url").get<std::string>();
-        if (image) { validate_openai_image_detail(value, "image_url.detail", "messages"); }
+        if (image != nullptr && value.contains("detail") && !value.at("detail").is_null()) {
+            if (!value.at("detail").is_string()) {
+                bad_request("image_url.detail must be a string", "messages");
+            }
+            const std::string detail = value.at("detail").get<std::string>();
+            const auto parsed        = parse_image_detail(detail);
+            image->image_detail      = parsed.value_or(ninfer::ImageDetail::Auto);
+            if (!parsed) { image->unknown_image_detail = detail; }
+        }
     } else {
         bad_request(std::string(field) + " must be a URL string or object", "messages");
     }
@@ -322,7 +331,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Image;
-            parsed.source = parse_media_url(part, "image_url", true);
+            parsed.source = parse_media_url(part, "image_url", &parsed);
         } else if (type == "video_url") {
             // Qwen, vLLM, and SGLang use video_url as a Chat Completions extension for
             // multimodal models. NInfer maps it to the Engine's native Video input.
@@ -331,7 +340,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Video;
-            parsed.source = parse_media_url(part, "video_url", false);
+            parsed.source = parse_media_url(part, "video_url", nullptr);
         } else {
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");
@@ -980,6 +989,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_tool_constraints(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
     parse_messages(body, limits.assistant_prefill, output.generation);
+    settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     if (body.contains("logprobs") && body.at("logprobs").is_boolean()) {

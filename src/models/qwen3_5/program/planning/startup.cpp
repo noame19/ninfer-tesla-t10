@@ -676,7 +676,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
         mtp_full_call(mtp_align, 1, text_envelope, false);
         WorkspaceLayoutBuilder mtp_proposal;
         proposal_scratch(mtp_proposal, 1);
-        const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+        const std::size_t accept = ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
             dimension(parameters.model.resources().public_token_count), narrowest_drafts,
             verify_drafts, 1, 1);
         out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
@@ -722,7 +722,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
             WorkspaceLayoutBuilder proposal;
             proposal_scratch(proposal, batch);
             const std::size_t batch_accept =
-                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), narrowest_drafts,
                     verify_drafts, batch, batch);
             const std::size_t gather = ops::logprob_topk_workspace_capacity_bytes(
@@ -903,7 +903,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               narrowest_drafts, verify_drafts, batch, batch)
-                        : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                        : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count),
                               narrowest_drafts, verify_drafts, batch, batch);
                 // A copy round above batch one also runs the drafter at its own window, and a
@@ -928,7 +928,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
         const std::uint64_t columns = stage_boundary_columns(plan);
         const std::size_t residual =
             static_cast<std::size_t>(columns) * static_cast<std::size_t>(config.hidden_size) * 2U;
-        const std::size_t control = (6U * static_cast<std::size_t>(columns) + 16U) * 4U;
+        const auto control = static_cast<std::size_t>(stage_control_bytes(columns));
         out.general_capacity =
             checked_add(out.general_capacity, checked_add(residual, control, "stage boundary") + 1024U,
                         "stage boundary workspace");
@@ -1053,7 +1053,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
-            options.speculative.proposal_head != ProposalHead::Full) {
+            models::planned_proposal_head(options.speculative.proposal_head) !=
+                ProposalHead::Full) {
             throw std::invalid_argument(
                 "disabled speculative decoding requires draft_tokens=0 and the full proposal head");
         }
@@ -1083,12 +1084,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     // 12.0 is admitted alongside the qualified capabilities: consumer Blackwell runs the same
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
-    // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
-    // supported here in the sense of running correctly, not of being tuned for.
-    if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
-        device.compute_capability() != 89 && device.compute_capability() != 120) {
+    // memory per SM. 7.5 (Turing) runs them too -- its m16n8k8/m8n8k16 tensor cores and its
+    // emulations of m16n8k16/m16n8k32 in ops/common/mma.cuh produce the same results -- but it has
+    // only 64 KiB of shared memory per SM, so the prompt-attention and GDN split-K routes that
+    // assume 100 KiB are replaced (see the sm_75 branches in causal_softmax_attention.cpp and
+    // gdn_gating_proj). The occupancy and split-k choices remain the sm_86 ones, so these cards run
+    // correctly rather than tuned.
+    if (device.compute_capability() != 75 && device.compute_capability() != 80 &&
+        device.compute_capability() != 86 && device.compute_capability() != 89 &&
+        device.compute_capability() != 120) {
         throw std::invalid_argument(
-            "Qwen3.5 family runtime requires compute capability 8.0, 8.6, 8.9 or 12.0");
+            "Qwen3.5 family runtime requires compute capability 7.5, 8.0, 8.6, 8.9 or 12.0");
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
@@ -1416,7 +1422,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_min_match            = options.speculative.ngram_min_match,
         .speculative_backend        = options.speculative.backend,
         .kv_storage                 = options.kv_cache,
-        .proposal_head              = options.speculative.proposal_head,
+        .proposal_head = models::planned_proposal_head(options.speculative.proposal_head),
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),

@@ -125,7 +125,8 @@ std::string item_id(const Json& item, const char* prefix) {
     return item.at("id").get<std::string>();
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
+// `image` receives the part's detail.
+ninfer::product::media_acquire::Source parse_image_source(const Json& part, ContentPart& image) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id requires a Files API, which NInfer does not provide",
                     "input", "file_inputs_not_supported");
@@ -134,7 +135,15 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         part.at("image_url").get_ref<const std::string&>().empty()) {
         bad_request("input_image must contain a non-empty image_url", "input");
     }
-    validate_openai_image_detail(part, "input_image.detail", "input");
+    if (part.contains("detail") && !part.at("detail").is_null()) {
+        if (!part.at("detail").is_string()) {
+            bad_request("input_image.detail must be a string", "input");
+        }
+        const std::string detail = part.at("detail").get<std::string>();
+        const auto parsed        = parse_image_detail(detail);
+        image.image_detail       = parsed.value_or(ninfer::ImageDetail::Auto);
+        if (!parsed) { image.unknown_image_detail = detail; }
+    }
 
     ninfer::product::media_acquire::Source source;
     source.value = part.at("image_url").get<std::string>();
@@ -257,11 +266,12 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         ContentPart part;
         part.kind     = ContentKind::Image;
         part.type_raw = type;
-        part.source   = parse_image_source(value);
+        part.source   = parse_image_source(value, part);
         apply_shared_breakpoint(part, value, breakpoint_count);
+        Json canonical{{"type", "input_image"},
+                       {"image_url", value.at("image_url")},
+                       {"detail", image_detail_name(part.image_detail)}};
         parsed.turn.content.push_back(std::move(part));
-        Json canonical{
-            {"type", "input_image"}, {"image_url", value.at("image_url")}, {"detail", "auto"}};
         if (value.contains("prompt_cache_breakpoint")) {
             canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
         }
@@ -513,7 +523,7 @@ ChatTurn parse_function_call_output_item(
                 ContentPart part;
                 part.kind     = ContentKind::Image;
                 part.type_raw = type;
-                part.source   = parse_image_source(value);
+                part.source   = parse_image_source(value, part);
                 apply_shared_breakpoint(part, value, breakpoint_count);
                 turn.content.push_back(std::move(part));
             } else if (type == "input_file") {
@@ -1098,6 +1108,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     if (body.contains("input") && !body.at("input").is_null()) {
         parse_input(body.at("input"), out.prompt, out.tool_identities,
                     limits.lenient_assistant_history);
+        settle_image_details(out.prompt.input_turns, limits, "input", "input_image.detail");
     }
     if (body.contains("instructions") && !body.at("instructions").is_null()) {
         if (!body.at("instructions").is_string()) {

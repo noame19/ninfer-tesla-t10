@@ -417,6 +417,16 @@ namespace detail {
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
+#if defined(NINFER_SM75)
+    // Turing has 64 KiB of shared memory per SM; the prompt kernels need 91-96 KiB. The KV page is
+    // fixed at 64 keys, so the staged K (16 KiB), V (16 KiB) and FP16 V (32 KiB) tiles alone reach
+    // 64 KiB before Q, P and the scales, and no tile shape fits. Only the small-T kernels, whose
+    // arena is 32 KiB, fit, so every branch that would take the prompt route falls back to the
+    // chunked small-T route, which splits a wide prefill into 8-token chunks.
+    constexpr CausalAttentionRoute kPromptFallback = CausalAttentionRoute::ChunkedSmallT;
+#else
+    constexpr CausalAttentionRoute kPromptFallback = CausalAttentionRoute::Prompt;
+#endif
     if (envelope.small_prefill && batch_size == 1 && width > kMaximumVerifyTokens &&
         width <= kMaximumSingleRowVerifyTokens) {
         const std::uint32_t keys_per_row =
@@ -424,7 +434,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
         if (envelope.max_visible_keys >= static_cast<std::uint32_t>(width) * keys_per_row) {
             return CausalAttentionRoute::ChunkedSmallT;
         }
-        return CausalAttentionRoute::Prompt;
+        return kPromptFallback;
     }
     const std::int32_t maximum_verify_tokens = batch_size == 1 && envelope.wide_verification
                                                    ? kMaximumSingleRowVerifyTokens
@@ -457,7 +467,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                 prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
                 break;
             }
-            if (envelope.max_visible_keys <= prompt_limit) return CausalAttentionRoute::Prompt;
+            if (envelope.max_visible_keys <= prompt_limit) return kPromptFallback;
         }
         return width <= 8 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
     }
@@ -468,7 +478,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
     if (q_heads == 16 && width <= maximum_verify_tokens &&
         envelope.max_visible_keys > prompt_visible_keys)
         return CausalAttentionRoute::ChunkedSmallT;
-    return CausalAttentionRoute::Prompt;
+    return kPromptFallback;
 }
 
 const char* causal_attention_route_name(CausalAttentionRoute route) {

@@ -1,0 +1,187 @@
+# Builds the Turing (sm_75) port for the NVIDIA Tesla T10 (TU102, 16 GB).
+#
+# GitHub-hosted runners have no GPU, but nvcc only needs to *compile* for sm_75, so the whole
+# product builds here; the binaries are uploaded for the maintainer to download and run on the T10.
+#
+# The build runs on a **Debian 12** base, deliberately. The T10 host is Debian 12 (glibc 2.36,
+# GCC 12 -> GLIBCXX_3.4.30, FFmpeg 5.1), and a binary must not require anything newer than the
+# machine it will run on. CUDA 13.4 comes from NVIDIA's Debian 12 apt repository; the CUDA runtime
+# libraries it links (libcudart.so.13, libcublas.so.13) are supplied on the host at run time.
+#
+# ccache is carried between runs so an iteration that touches a few translation units recompiles
+# only those instead of the whole tree.
+name: build-sm75
+
+on:
+  push:
+    branches: [sm75, 'sm75/**']
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: CMAKE_CUDA_ARCHITECTURES to build
+        required: false
+        default: '75'
+      cache_suffix:
+        description: Bump to force a fresh ccache namespace
+        required: false
+        default: 'v2'
+
+concurrency:
+  group: build-sm75-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-sm75:
+    name: CUDA build (sm_75, no GPU, Debian 12 base)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Disk before
+        run: df -h /
+
+      - uses: actions/checkout@v5
+
+      - name: ccache location
+        run: |
+          echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ccache"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-sm75-${{ github.event.inputs.cache_suffix || 'v2' }}-${{ github.sha }}
+          restore-keys: |
+            ccache-sm75-${{ github.event.inputs.cache_suffix || 'v2' }}-
+
+      - name: Build sm_75 on Debian 12
+        env:
+          ARCH: ${{ github.event.inputs.arch || '75' }}
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
+            -e NINFER_CUDA_ARCH="$ARCH" -e NINFER_BUILD_DIR=/src/build-sm75 \
+            -e NINFER_TESTS=OFF -e NINFER_MULTICALL=OFF -e NINFER_JOBS=4 \
+            -e NINFER_BENCHMARKS=ON \
+            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=6G -e CCACHE_COMPILERCHECK=content \
+            -e DEBIAN_FRONTEND=noninteractive \
+            debian:12 bash -c '
+              set -eux
+              apt-get update
+              apt-get install --yes --no-install-recommends \
+                ca-certificates curl gnupg ccache ninja-build pkg-config git file rsync \
+                gcc-12 g++-12 \
+                libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+                libcurl4-openssl-dev zlib1g-dev python3 python3-jinja2
+
+              # CMake: Debian 12 ships 3.25 and the tree needs 3.28. Take the upstream static build.
+              curl -fsSLo /tmp/cmake.tgz \
+                https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz
+              tar -xzf /tmp/cmake.tgz -C /opt
+              export PATH=/opt/cmake-3.31.6-linux-x86_64/bin:$PATH
+
+              # CUDA 13.4 from NVIDIA Debian 12 repository: the CUDA 13 branch is what ships the
+              # libcudart.so.13 / libcublas.so.13 the maintainer host already has.
+              curl -fsSLo /tmp/cuda-keyring.deb \
+                https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+              dpkg -i /tmp/cuda-keyring.deb
+              apt-get update
+              apt-get install --yes --no-install-recommends cuda-toolkit-13-4
+              export PATH=/usr/local/cuda/bin:$PATH
+              export CUDACXX=/usr/local/cuda/bin/nvcc
+
+              export CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12 CUDAHOSTCXX=/usr/bin/g++-12
+              nvcc --version
+              cmake --version
+              ccache --zero-stats
+              # -k 0 keeps going so one run surfaces every compile error, not just the first.
+              # The server is the deliverable; the benchmark executables are the measurement rig
+              # (pure-read bandwidth ceiling, per-Op GB/s, Engine-level pp/tg and roofline
+              # accounting). They are built in the same configuration so a measurement and the
+              # server it explains come from one commit.
+              scripts/build-native.sh configure
+              cmake --build "$NINFER_BUILD_DIR" \
+                --target ninfer-serve ninfer-perplexity ninfer_bench ninfer_benches ninfer-hbm-bandwidth-probe \
+                --parallel "$NINFER_JOBS" -- -k 0
+              ccache --show-stats
+            ' 2>&1 | tee build-sm75.log
+
+      - name: Report what the binary needs
+        if: always()
+        run: |
+          {
+            echo "## sm_75 build"
+            echo '```'
+            grep -E "error:|fatal error:|FAILED:" build-sm75.log | sort -u | head -200 || true
+            echo "--- built products ---"
+            for p in apps/ninfer-serve bench/ninfer_bench bench/ninfer_benches \
+                     tools/ninfer-hbm-bandwidth-probe; do
+              if [ -e "build-sm75/$p" ]; then ls -la "build-sm75/$p"; else echo "MISSING $p"; fi
+            done
+            if [ -e build-sm75/apps/ninfer-serve ]; then
+              echo "--- highest GLIBC/GLIBCXX required ---"
+              objdump -T build-sm75/apps/ninfer-serve 2>/dev/null \
+                | grep -oE "GLIBC_[0-9.]+|GLIBCXX_[0-9.]+" | sort -Vu | tail -6 || true
+              echo "--- NEEDED ---"
+              objdump -p build-sm75/apps/ninfer-serve 2>/dev/null | grep NEEDED || true
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-sm75-${{ github.event.inputs.cache_suffix || 'v2' }}-${{ github.sha }}
+
+      - name: Stage binaries
+        if: always()
+        run: |
+          mkdir -p dist dist-bench dist-tools
+          if [ -e build-sm75/apps/ninfer-serve ]; then
+            cp -a build-sm75/apps/ninfer-serve dist/
+          fi
+          if [ -e build-sm75/apps/ninfer-perplexity ]; then
+            cp -a build-sm75/apps/ninfer-perplexity dist-tools/
+          fi
+          for p in bench/ninfer_bench bench/ninfer_benches tools/ninfer-hbm-bandwidth-probe; do
+            if [ -e "build-sm75/$p" ]; then cp -a "build-sm75/$p" dist-bench/; fi
+          done
+          ls -la dist dist-bench dist-tools || true
+
+      - name: Upload binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-sm75
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload benchmarks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-sm75-bench
+          path: dist-bench/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload tools
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninfer-sm75-tools
+          path: dist-tools/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-sm75-log
+          path: build-sm75.log
+          if-no-files-found: warn
+          retention-days: 14

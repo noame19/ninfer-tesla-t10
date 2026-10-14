@@ -719,6 +719,18 @@ PinnedHostBuffer::~PinnedHostBuffer() {
     else { free_pinned(data_); }
 }
 
+HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes) {
+    if (!data || !bytes) { throw std::invalid_argument("host registration needs a nonempty allocation"); }
+    const cudaError_t error = cudaHostRegister(data, bytes, cudaHostRegisterPortable);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaHostRegister failed", error));
+    }
+    data_ = data;
+}
+HostMemoryRegistration::~HostMemoryRegistration() {
+    if (data_) { log_cuda_error("cudaHostUnregister", cudaHostUnregister(data_)); }
+}
+
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
     : data_(other.data_), size_(other.size_), resident_session_(std::move(other.resident_session_)) {
     other.data_ = nullptr;

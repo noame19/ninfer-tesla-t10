@@ -701,27 +701,25 @@ int test_messages_and_media() {
                           media.messages[0].content[1].kind == ContentKind::Video,
                       "image and video compatibility inputs normalize to Engine media");
 
-    for (const Json detail : {Json("auto"), Json("low"), Json("high"), Json("original"), Json(nullptr)}) {
-        body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
-        const GenerationRequest lowered = parse(body).generation;
-        failures += check(lowered.media_item_count() == 2 &&
-                              lowered.messages[0].content[0].source.kind ==
-                                  media.messages[0].content[0].source.kind &&
-                              lowered.messages[0].content[0].source.value ==
-                                  media.messages[0].content[0].source.value,
-                          "recognized image detail falls back to the same auto media input");
+    failures += check(media.messages[0].content[0].image_detail == ninfer::ImageDetail::Auto,
+                      "image detail auto was not kept");
+    for (const auto& [name, detail] : {std::pair{"low", ninfer::ImageDetail::Low},
+                                       std::pair{"high", ninfer::ImageDetail::High}}) {
+        body["messages"][0]["content"][0]["image_url"]["detail"] = name;
+        failures += check(parse(body).generation.messages[0].content[0].image_detail == detail,
+                          "an OpenAI image detail was not carried to the media");
     }
-    body["messages"][0]["content"][0]["image_url"].erase("detail");
-    failures += check(parse(body).generation.media_item_count() == 2,
-                      "omitted image detail retains auto behavior");
-    for (const Json detail : {Json("medium"), Json("HIGH"), Json(""), Json(64), Json(true),
-                              Json::object(), Json::array()}) {
-        body["messages"][0]["content"][0]["image_url"]["detail"] = detail;
-        const ApiError error = api_error([&] { (void)parse(body); });
-        failures += check(error.status == 400 && error.param == "messages" &&
-                              (!detail.is_string() || error.code == "invalid_value"),
-                          "unknown or malformed image detail remains an HTTP 400 error");
-    }
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "original";
+    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
+                      "an unknown image detail was accepted");
+    RequestLimits lenient        = limits();
+    lenient.lenient_image_detail = true;
+    const auto lenient_media     = parse_chat_completion_request(body, lenient).generation;
+    failures += check(lenient_media.messages[0].content[0].image_detail ==
+                              ninfer::ImageDetail::Auto &&
+                          lenient_media.messages[0].content[0].unknown_image_detail.empty(),
+                      "--lenient-image-detail did not read an unknown detail as auto");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "auto";
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();

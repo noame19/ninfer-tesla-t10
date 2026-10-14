@@ -401,13 +401,21 @@ int rotation_of(const AVStream* stream) {
     if (tag != nullptr) {
         rotation = static_cast<int>(std::nearbyint(std::strtod(tag->value, nullptr)));
     }
-    const AVPacketSideData* side =
-        av_packet_side_data_get(stream->codecpar->coded_side_data,
-                                stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    // FFmpeg 6.0 carries the display matrix as coded side data on the codec parameters.
+    const AVPacketSideData* side = av_packet_side_data_get(
+        stream->codecpar->coded_side_data, stream->codecpar->nb_coded_side_data,
+        AV_PKT_DATA_DISPLAYMATRIX);
     if (side != nullptr && side->size >= 9 * sizeof(std::int32_t)) {
         rotation = static_cast<int>(std::nearbyint(
             -av_display_rotation_get(reinterpret_cast<const std::int32_t*>(side->data))));
     }
+#else
+    // FFmpeg 5.1 (Debian 12's) has no AVCodecParameters.coded_side_data -- that member arrived
+    // with 6.0 -- and the pre-6.0 stream-side accessor was removed in the same release, so a
+    // display-matrix rotation cannot be read here. The "rotate" metadata tag above still applies.
+    (void)stream;
+#endif
     rotation %= 360;
     if (rotation < 0) { rotation += 360; }
     if (rotation == 89 || rotation == 91) { rotation = 90; }

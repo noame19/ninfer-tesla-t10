@@ -32,6 +32,23 @@ static_assert(kSamplerPartialTileItems == (1 << kSamplingTileIndexBits));
 using SamplingTileWarpSort     = cub::WarpMergeSort<unsigned long long, kSamplerItemsPerThread>;
 using SamplingBf16TileWarpSort = cub::WarpMergeSort<unsigned int, kSamplerItemsPerThread>;
 
+// __reduce_max_sync lowers to redux.sync, an Ampere (sm_80) instruction Turing does not have. The
+// mask at every call site is the leading kSamplingTileWarps lanes of one warp, so a shuffle
+// butterfly over exactly those lanes (offsets from group-width/2 down to 1, which is always a power
+// of two) computes the same reduction.
+__device__ __forceinline__ unsigned int sampling_max_sync(unsigned int mask, unsigned int value) {
+#if defined(NINFER_SM75)
+    const int width = __popc(mask);
+    for (int offset = width >> 1; offset > 0; offset >>= 1) {
+        const unsigned int other = __shfl_xor_sync(mask, value, offset);
+        value                    = value > other ? value : other;
+    }
+    return value;
+#else
+    return __reduce_max_sync(mask, value);
+#endif
+}
+
 struct SamplingTileTopKStorage {
     typename SamplingTileWarpSort::TempStorage warp[kSamplingTileWarps];
     unsigned long long candidates[kSamplingTileWarps * kSamplerCandidateCap];
@@ -193,9 +210,9 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
             const unsigned long long key =
                 storage.candidates[lane * kSamplerCandidateCap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int max_high = sampling_max_sync(kMergeMask, high);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int max_low  = sampling_max_sync(kMergeMask, low);
             const unsigned int winners =
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
@@ -232,7 +249,7 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
             const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int best    = sampling_max_sync(kMergeMask, key);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {
@@ -432,31 +449,17 @@ __device__ __forceinline__ void sampling_build_truncated_block_fast(
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
 }
 
-// thread-0 helper: inverse-CDF pick over a normalized `prob[0..n-1]` support,
-// optionally excluding `exclude` (a rejected draft token) and renormalizing over
-// the remainder. `u` is a uniform in [0,1). Returns the chosen vocab id.
-__device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, const float* prob,
-                                                          int n, int exclude, float u) {
-    float mass = 0.0f;
+// thread-0 helper: the inverse-CDF draw of every keyed sample -- the rank of the first candidate
+// whose cumulative normalized weight exceeds `u`, the last one when rounding leaves the sum at or
+// below `u`. sample() and coupled speculative verification share it, so the same key and the
+// same distribution give the same token on both routes.
+__device__ __forceinline__ int sampling_pick_rank(const float* prob, int n, float u) {
+    float acc = 0.0f;
     for (int j = 0; j < n; ++j) {
-        if (cand_idx[j] == exclude) { continue; }
-        mass += prob[j];
-    }
-    if (mass <= 0.0f) {
-        // Degenerate: support is only the excluded token. Return it (caller only
-        // reaches this when accept probability was ~1, i.e. it will not happen).
-        return cand_idx[0];
-    }
-    const float goal = u * mass;
-    float acc        = 0.0f;
-    int picked       = -1;
-    for (int j = 0; j < n; ++j) {
-        if (cand_idx[j] == exclude) { continue; }
         acc += prob[j];
-        picked = cand_idx[j];
-        if (goal < acc) { return picked; }
+        if (u < acc) { return j; }
     }
-    return picked;
+    return n - 1;
 }
 
 } // namespace ninfer::ops

@@ -1,0 +1,103 @@
+{
+ "schema": "ninfer.device-route-profiles",
+ "schema_version": 2,
+ "devices": [
+  {
+   "hardware_class": "nvidia-tesla-t10-sm75",
+   "multiprocessors": 56,
+   "origin": "hand-written T10 profile, measured 2026-10-13: attention launch tiers for sm_75 plus the two-stage GDN prefill route",
+   "routes": {
+    "attn_i8_small/h24/rk4v4-e8/w1": [
+     [
+      65536,
+      "4x2x32e"
+     ],
+     [
+      1048576,
+      "8x2x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w2": [
+     [
+      8192,
+      ""
+     ],
+     [
+      1048576,
+      "4x2x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w3": [
+     [
+      1048576,
+      "4x2x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w4": [
+     [
+      8192,
+      "16x1x32"
+     ],
+     [
+      1048576,
+      "4x2x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w5": [
+     [
+      8192,
+      "16x1x32"
+     ],
+     [
+      1048576,
+      "4x2x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w6": [
+     [
+      8192,
+      "12x1x32qe"
+     ],
+     [
+      65536,
+      ""
+     ],
+     [
+      1048576,
+      "6x2x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w7": [
+     [
+      8192,
+      "12x1x32qe"
+     ],
+     [
+      1048576,
+      "6x2x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w8": [
+     [
+      8192,
+      "12x1x32qe"
+     ],
+     [
+      1048576,
+      "6x2x32qe"
+     ]
+    ],
+    "gdn_two_stage/h48": [
+     [
+      2147483647,
+      "on"
+     ]
+    ]
+   },
+   "calibration": {
+    "route_catalog": "ac2d7b3e311831b0",
+    "ninfer_build": "probe"
+   }
+  }
+ ]
+}

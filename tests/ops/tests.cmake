@@ -13,6 +13,7 @@ set(ninfer_op_tests
   moe_route
   moe_experts
   moe_experts_gguf
+  moe_experts_native
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm
@@ -139,6 +140,10 @@ ninfer_add_op_test(ninfer_sparse_moe_route_network_test
 # Table decode of the E8 root codec against its arithmetic reference, over every code pair.
 ninfer_add_op_test(ninfer_e8_root_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_e8_root_decode.cu"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_fixed_point_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fixed_point.cu"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_mtp_pack_test
@@ -294,3 +299,9 @@ foreach(table IN ITEMS legacy unified)
     ninfer_linear_add_bf16_a16_${table}_routes_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT NINFER_LINEAR_ROUTES=${table})
 endforeach()
+ninfer_add_test(ninfer_moe_expert_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_expert_cpu.cpp"
+  LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_gguf_expert_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu.cpp"
+  LIBRARIES ninfer_ops)

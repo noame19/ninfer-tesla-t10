@@ -99,9 +99,20 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
 // The conversion saturates: finite values beyond the FP16 range become +-65504 instead of
 // infinity, and NaN stays NaN.
 static __device__ __forceinline__ __half2 float2_to_f16x2_clamped(float low, float high) {
+#if defined(NINFER_SM75)
+    // cvt.rn.satfinite.f16x2.f32 is sm_80. Round each half to f16, then saturate the values that
+    // overflowed to +-65504 the way satfinite does; NaN (which rounds to NaN, not inf) is kept.
+    const auto clamp = [](float value) {
+        const __half rounded = __float2half_rn(value);
+        if (__hisinf(rounded)) { return __float2half_rn(value > 0.0f ? 65504.0f : -65504.0f); }
+        return rounded;
+    };
+    return __halves2half2(clamp(low), clamp(high));
+#else
     std::uint32_t bits;
     asm("cvt.rn.satfinite.f16x2.f32 %0, %1, %2;" : "=r"(bits) : "f"(high), "f"(low));
     return *reinterpret_cast<const __half2*>(&bits);
+#endif
 }
 
 template <int ROWS, int STRIDE, int THREADS, class View>
@@ -129,9 +140,17 @@ issue_load_f16_to_float_vec4(View view, const __half* __restrict__ gmem_base_row
 // scaled V/K panels it multiplies (shared by every U/W entry), plus the output's decayed A matrix.
 // State-passing operands stay truncated; rounding them changes nothing measurable.
 static __device__ __forceinline__ float round_to_tf32(float value) {
+#if defined(NINFER_SM75)
+    // Turing has neither cvt.rna.tf32.f32 nor a tf32 MMA. The emulated mma_tf32_bits converts its
+    // operands to f16 before running them on the f16 unit, which rounds to the same 11-bit
+    // significand tf32 carries, so the explicit tf32 rounding would not change the result.
+    (void)value;
+    return value;
+#else
     std::uint32_t bits;
     asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(bits) : "f"(value));
     return __uint_as_float(bits);
+#endif
 }
 
 // Per-token q/k L2 normalization factors rsqrt(sum(x^2) + 1e-6), stored head-major [H_qk, T] so

@@ -27,10 +27,12 @@ if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
   set(NINFER_FFMPEG_TARGET ninfer_ffmpeg_dependencies)
 else()
   find_package(PkgConfig REQUIRED)
-  # Keep the floors the previous root build required: src/media/decode/decode.cpp is written
-  # against these ABIs, so an older installation must fail at configure rather than at link.
+  # Keep a floor that every ABI decode.cpp actually uses provides: src/media/decode/decode.cpp is
+  # written against these, so an older installation must fail at configure rather than at link.
+  # FFmpeg 5.1 (libavformat 59 / libavcodec 59 / libavutil 57 / libswscale 6, Debian 12's) is
+  # enough: the one call that needs 6.0, av_packet_side_data_get, is behind a version check.
   pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+    libavformat>=59 libavcodec>=59 libavutil>=57 libswscale>=6)
   set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
 endif()
 

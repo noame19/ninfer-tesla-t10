@@ -18,11 +18,22 @@ __global__ void widen_kernel(const __half2* __restrict__ in, float2* __restrict_
     }
 }
 
+// The state is a running sum over the sequence, so a value that outgrows f16's range would become
+// infinity and stay there: the recurrence reads the narrowed state back on the next step, and inf
+// poisons every later one. Saturate rather than overflow, keeping NaN as NaN. The cost of a
+// saturated element is its distance to 65504; the cost of an infinity is the rest of the sequence.
+__device__ __forceinline__ __half saturate_f16(float value) {
+    const __half rounded = __float2half_rn(value);
+    if (__hisinf(rounded)) { return __float2half_rn(value > 0.0f ? 65504.0f : -65504.0f); }
+    return rounded;
+}
+
 __global__ void narrow_kernel(const float2* __restrict__ in, __half2* __restrict__ out,
                               std::int64_t pairs) {
     for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < pairs; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
-        out[i] = __float22half2_rn(in[i]);
+        const float2 values = in[i];
+        out[i] = __halves2half2(saturate_f16(values.x), saturate_f16(values.y));
     }
 }
 
