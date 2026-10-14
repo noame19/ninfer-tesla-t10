@@ -853,6 +853,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         throw std::invalid_argument(
             "strict requires all selected weights resident on the device; "
             "the artifact materialized pinned Host weights");
+    }
     // An automatic Host budget is sized now that the weights are in place, from what the host
     // still has; the media caches grow after startup, so they are reserved too.
     if (options.context_cache.host_cache_auto) {

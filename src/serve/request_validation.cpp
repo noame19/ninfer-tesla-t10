@@ -25,6 +25,8 @@ void parse_tool_constraints(const RequestJson& body, GenerationRequest& request)
     if (mode == "basic") request.tool_choice.constraints = ToolConstraintMode::Basic;
     else if (mode == "auto") request.tool_choice.constraints = ToolConstraintMode::Automatic;
     else bad_request("tool_constraints must be 'basic' or 'auto'", "tool_constraints");
+}
+
 void settle_image_details(std::vector<ChatTurn>& turns, const RequestLimits& limits,
                           const std::string& param, const std::string& field) {
     for (ChatTurn& turn : turns) {
