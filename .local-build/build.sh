@@ -18,6 +18,10 @@ image="${NINFER_BUILD_IMAGE:-ninfer-sm75-build}"
 # Point NINFER_NVIDIA_PREFIX at any prefix holding cu13/include and cu13/lib.
 nvidia_prefix="${NINFER_NVIDIA_PREFIX:-/home/agent/comfyui/.venv/lib/python3.11/site-packages/nvidia}"
 ccache_dir="${NINFER_CCACHE_DIR:-$repo/.ccache}"
+# The build tree and ccache are symlinks onto the secondary disk (the root filesystem is nearly
+# full), and a bind mount does not follow them. Mount their target at the same absolute path so
+# /src/build-sm75 resolves inside the container.
+secondary="${NINFER_SECONDARY_ROOT:-/mnt/disk238g/ninfer}"
 
 if [ ! -d "$nvidia_prefix/cu13/include" ]; then
   printf 'no cublas headers at %s/cu13/include -- set NINFER_NVIDIA_PREFIX\n' "$nvidia_prefix" >&2
@@ -29,6 +33,7 @@ exec docker run --rm -i \
   --user "$(id -u):$(id -g)" \
   -v "$repo:/src" \
   -v "$ccache_dir:/ccache" \
+  -v "$secondary:$secondary" \
   -v "$nvidia_prefix:/opt/nvidia:ro" \
   -e HOME=/tmp \
   -e NINFER_CUDA_ARCH="${NINFER_CUDA_ARCH:-75}" \
