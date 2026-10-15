@@ -2,6 +2,12 @@
 
 These rules apply to the whole repository.
 
+**This checkout is the sm_75 (NVIDIA Tesla T10) port of NInfer.** It has its own working rules,
+which sit at the end of this file under [sm_75 port line](#sm_75-port-line-the-tesla-t10-port).
+Read that section and [`docs/remaining-sm75-work.md`](docs/remaining-sm75-work.md) before starting
+work here: the task list, the branch names and the build route all live there, and the sections
+below describe the upstream project rather than this line's pending work.
+
 ## Objective and scope
 
 Complete the user's explicit deliverable within the applicable product and external contracts.
@@ -222,3 +228,84 @@ work runs on rented hosts through `scripts/pods` ([pods](scripts/pods/README.md)
 
 Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
 such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.
+
+---
+
+## sm_75 port line (the Tesla T10 port)
+
+This fork exists to run NInfer well on an **NVIDIA Tesla T10 (TU102, sm_75)** — 56 SMs, 4 MiB L2,
+15.57 GiB, no `cp.async`, no native bf16 MMA. Everything below is specific to this line; the
+sections above describe upstream.
+
+### The acceptance artifact and the measurement baseline
+
+One artifact is the baseline for every claim on this line:
+`/home/agent/local_model/model/Qwen3.8-27B/Qwen3.8-27B-Coder390-EfficientThink-Q2LynnStyle-Q8MTP.ninfer`.
+Do not measure against anything else unless the task names another model (the 4B/9B artifacts under
+`~/work-rom/ninfer-convert/out/` are for the dense-geometry work).
+
+Current figures and the task list are in
+[`docs/remaining-sm75-work.md`](docs/remaining-sm75-work.md). Reuse those numbers; re-measuring a
+figure that is already recorded wastes the card and an iteration.
+
+### Building: local Docker only
+
+**Never build through CI.** Every cloud round costs ~1.7 GB of artifact downloads, and this line has
+no traffic budget. The local toolchain is `.local-build/` (see its
+[README](.local-build/README.md)):
+
+```
+.local-build/build.sh scripts/build-native.sh configure
+.local-build/build.sh scripts/build-native.sh target ninfer-serve ninfer-perplexity
+```
+
+The image `ninfer-sm75-build` contains nvcc 13.4, CMake 3.31.6 and g++-12 — the same versions CI
+uses — so a local build is not a different product. The build tree is `build-sm75/` and ccache is
+`.ccache/`; both are symlinks onto `/mnt/disk238g` because the root filesystem is nearly full.
+
+**Incremental builds are cheap; header edits are not.** Before touching a widely included header,
+check its blast radius — `mma.cuh` invalidates 76 translation units (1–2 h), `small_t_i8_launch.cuh`
+28 (60–100 min), `mmq.cuh` 17 (~15 min). A `.cu`-only edit is minutes. Batch changes that share a
+directory into one build instead of paying twice.
+
+### Branches and merging
+
+* **`sm75` is the single main line.** It is the integration point and the source of the one
+  `ninfer-serve` that carries every feature.
+* **One task, one branch, named for the task**: `sm75-p4`, `sm75-p5`, `sm75-p0`. `P<n>` is the task
+  identity in `docs/remaining-sm75-work.md` and does not change when priorities are reordered. An
+  experiment that is not a task in that list gets no branch.
+* **A branch merges into `sm75` when its own acceptance condition is met *and* quality is
+  unchanged.** Speed tasks show measured prefill/tok-s against the recorded figures; capability tasks
+  show the artifact starting and running. Numerics-touching changes must show PPL on the same build,
+  bit-exact for pure data movement (3.01334 for the acceptance artifact).
+* **A failed experiment still gets a commit** with its measurement and why it lost, then the branch
+  is deleted. Do not leave it merged. `docs/sm75-prefill-bottleneck.md` and the P2b entry in the
+  task list are the model for this.
+* **Push after merging.** `git push` on this line's branch name is the backup.
+* **Do not create branches that are not a task**, do not commit work-in-progress without a
+  measurement, and do not leave stale branches behind.
+* **`sm75-kvmem-official` belongs to the KVMem work (task P1).** Its own upstream line carries it and
+  its workflow copy still builds on push. Merge this line's work into it rather than the reverse
+  until P1 lands.
+
+### Measurement discipline
+
+Use `tools/t10-perf/` (see its [README](tools/t10-perf/README.md)); `measure.sh` is the two-sided
+gate. The rules that were learned the hard way:
+
+* **`nsys`, never `ncu`, on `mul_mat_q`.** Kernel replay on that kernel hard-froze this host twice.
+* **Do not `pkill -f ninfer-serve`** — the pattern matches the invoking shell and kills it (exit
+  143). Take the PID from `nvidia-smi --query-compute-apps=pid`.
+* **Use `waitfor.sh` for background jobs, not a fixed `sleep`**, which always costs the full duration
+  and loses the result when the job exits early.
+* **Interleave A/B rounds** when comparing two binaries; the card's own run-to-run spread has been
+  measured at ~12 tok/s at 11.2k (~2.4%), which is larger than several effects being chased.
+* **Record both sides in the commit message** — before and after, on which workload, with the PPL.
+
+### Reporting
+
+Report to the user at the end of every stage and stop there; do not run a long unbroken sequence of
+work. Say what was measured, what it means, and what the next step is. Keep the todo list ticked.
+When something fails or regresses, say so in the report with its numbers and not only the part that
+went well.

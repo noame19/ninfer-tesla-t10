@@ -48,6 +48,21 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
 - [Capability evaluation](../eval/README.md)
 - [Rented GPU hosts](../scripts/pods/README.md)
 
+## sm_75 (Tesla T10) port
+
+This checkout carries a port to `sm_75`, and its own working references:
+
+| Document | Purpose |
+|---|---|
+| [`remaining-sm75-work.md`](remaining-sm75-work.md) | the task list, its order of execution, and every figure the port's claims rest on |
+| [`sm75-prefill-bottleneck.md`](sm75-prefill-bottleneck.md) | where the prefill time goes on this card, and which explanations were measured and falsified |
+| [`device-profiles/`](device-profiles/) | the hand-written T10 route profile, and why its tiers are spelled as they are |
+| [`../.local-build/`](../.local-build/README.md) | the local Docker toolchain (nvcc 13.4 / CMake 3.31.6 / g++-12, the versions CI uses) |
+| [`../tools/t10-perf/`](../tools/t10-perf/README.md) | the measurement harness and the two-sided acceptance gate |
+
+`AGENTS.md`'s "sm_75 port line" section holds the branch, build and verification rules for this
+line.
+
 ## Maintainer references
 
 The references under [`maintainer/`](maintainer/) record current architecture, model, artifact,
