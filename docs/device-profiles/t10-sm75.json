@@ -5,7 +5,7 @@
   {
    "hardware_class": "nvidia-tesla-t10-sm75",
    "multiprocessors": 56,
-   "origin": "hand-written T10 profile, measured 2026-10-13: attention launch tiers for sm_75 plus the two-stage GDN prefill route",
+   "origin": "hand-written T10 profile, measured 2026-10-13: attention launch tiers for sm_75 plus the two-stage GDN prefill route; 2026-10-15: the w6/w7/w8 tiers past 8192 keys moved from 6x2x32qe to 12x1x32qe (a 6x2 tier cannot place two CTAs per SM: 16,448 static + 32,768 dynamic = 49,216 B)",
    "routes": {
     "attn_i8_small/h24/rk4v4-e8/w1": [
      [
@@ -55,36 +55,20 @@
     ],
     "attn_i8_small/h24/rk4v4-e8/w6": [
      [
-      8192,
-      "12x1x32qe"
-     ],
-     [
-      65536,
-      ""
-     ],
-     [
       1048576,
-      "6x2x32qe"
+      "12x1x32qe"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w7": [
      [
-      8192,
-      "12x1x32qe"
-     ],
-     [
       1048576,
-      "6x2x32qe"
+      "12x1x32qe"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w8": [
      [
-      8192,
-      "12x1x32qe"
-     ],
-     [
       1048576,
-      "6x2x32qe"
+      "12x1x32qe"
      ]
     ],
     "gdn_two_stage/h48": [
