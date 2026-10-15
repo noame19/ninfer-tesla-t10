@@ -90,3 +90,8 @@ repro/
 
 # WebUI releases unpacked by scripts/fetch-webui.sh for -DNINFER_WEBUI_DIR.
 third_party/webui/
+
+# The local build tree and ccache, symlinked onto the secondary disk so a cold build does not
+# fill the root filesystem.
+/build-sm75
+/.ccache
