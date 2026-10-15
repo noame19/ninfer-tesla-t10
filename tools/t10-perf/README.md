@@ -70,6 +70,22 @@ Taken on the Tesla T10 with the acceptance artifact, `rk4v4-e8` KV, 56 SMs:
 
 Re-measure rather than trusting these numbers if the card, driver, or acceptance artifact changed.
 
+## Baseline binaries
+
+An older build from before this line's work is kept for A/B comparison. It is the tree at commit
+`ecdd2b25` (identical source to `7cdafc8d` under `src/`, `third_party/`, `apps/`, `bench/`, `include/`),
+built for sm_75:
+
+| Binary | Path |
+|---|---|
+| serve | `~/work-rom/ninfer-run/stage1/ninfer-serve` |
+| perplexity | `~/work-rom/ninfer-run/tools/ninfer-perplexity` |
+
+**Do not use `stage2/`** (the reverted FP16 cuBLAS route, measured −8%) or `artifact3/` (no device
+profile, no attention tiers, no two-stage GDN). Both the 8-bit `.nv_fatbin` and `--version` are
+identical across those builds, so identify a binary by the commit it came from, never by its
+self-report.
+
 ## Outputs
 
 `ppl.sh` and the profiling scripts leave their own working files where the engine puts them
