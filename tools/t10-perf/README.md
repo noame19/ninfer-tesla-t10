@@ -69,3 +69,9 @@ Taken on the Tesla T10 with the acceptance artifact, `rk4v4-e8` KV, 56 SMs:
 | PPL (`--context 4096 --disjoint`) | 3.01334 | 8,190 scored tokens, bit-exact gate |
 
 Re-measure rather than trusting these numbers if the card, driver, or acceptance artifact changed.
+
+## Outputs
+
+`ppl.sh` and the profiling scripts leave their own working files where the engine puts them
+(`profiles/`, next to the current directory). They are transient and ignored by
+`.gitignore`'s `profiles/` rule; delete them freely.
