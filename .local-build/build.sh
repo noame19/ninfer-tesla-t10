@@ -36,7 +36,7 @@ exec docker run --rm -i \
   -e NINFER_TESTS="${NINFER_TESTS:-OFF}" \
   -e NINFER_MULTICALL="${NINFER_MULTICALL:-OFF}" \
   -e NINFER_BENCHMARKS="${NINFER_BENCHMARKS:-OFF}" \
-  -e NINFER_JOBS="${NINFER_JOBS:-4}" \
+  -e NINFER_JOBS="${NINFER_JOBS:-$(nproc)}" \
   -e CCACHE_DIR=/ccache \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-3G}" \
   -e CCACHE_COMPILERCHECK=content \
