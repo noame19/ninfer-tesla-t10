@@ -1,5 +1,13 @@
 # P2b — why the int8 MMQ kernel is slow, measured on the T10
 
+> **Outcome (2026-10-15): the pipeline this document argues for was written and measured, and it
+> is ~1.7% SLOWER. P2b is closed as a failed optimisation — do not restart it.** The half-tile
+> split was numerically exact (`PPL 3.01334` on every run, 12 interleaved A/B rounds), so the idea
+> was implemented correctly; it simply does not pay. The reason is in "Why it lost" at the end:
+> the kernel is register/occupancy bound, not stalled on the weight fetch, so overlapping the fetch
+> buys nothing while the doubled `__syncthreads()` count costs synchronisation. The load of these
+> numbers is a correction to the *hypothesis* in "Why it is slow", not to the measurements.
+
 Measurement host: NVIDIA Tesla T10 (TU102, 56 SMs, 4 MiB L2, 16 GB GDDR6), Debian 12, driver
 615.71.09 / CUDA UMD 13.4. Artifact
 `Qwen3.8-27B-Coder390-EfficientThink-Q2LynnStyle-Q8MTP.ninfer` (mixed IQ3_S/IQ4_XS/Q4_K/Q5_K/
@@ -18,6 +26,33 @@ IQ3_XXS/IQ2_S/Q2_K/Q4_0, 15.29 GiB of weights, 27.32 G weight-MACs per token col
 tok/s. Smaller chunks are worse, so keeping the activation working set inside L2 by shrinking the
 chunk does not pay. 2048 and 4096 refuse to start (`requested Engine runtime reservation requires
 3988188416 bytes, but only 3557097472 bytes are available for runtime capacity`).
+
+## Why it lost (P2b, measured)
+
+`sm75-p2b` split the x tile into its two 128-value halves and filled one while the MMA read the
+other (see `mmq-load-tiles.cuh`, `ggml_cuda_mmq_load_tiles_half_*`). Four `__syncthreads()` per K
+step against the original two. Result, four interleaved A/B rounds at 11.2k and four at 47.6k:
+
+| build | 11.2k prefill | 47.6k prefill | PPL |
+|---|---|---|---|
+| `stage1` (CI, no P2b) | 460.7 / 459.0 | 351.5 / 351.2 | 3.01334 |
+| `stage2` (CI, no P2b) | 474.0 / 467.0 / 460.3 | — | — |
+| local `sm75-p2b` | 452.8 / 452.1 | 346.4 / 346.4 | **3.01334** |
+
+The binary diff says exactly why. `cuobjdump --dump-resource-usage` over the whole executable:
+the P2b vs no-P2b builds differ in **29 functions, all of them MMQ kernels**, and every one of them
+**grew**. `mul_mat_q<Q4_K,J=16>` REG 128→138, `mul_mat_q<Q5_K,J=16>` 140→150,
+`mul_mat_q<IQ3_XXS,J=16>` 124→144, up to **+26 registers** on the `J=16` shapes, with the matching
+`moe_mul_mat_q` variants growing too. The kernel already compiles at `REG:255`, so the extra live
+values across the pipeline are exactly what the schedule could not absorb — occupancy and issue
+slots, not the weight fetch, are what the T10 MMQ is short of.
+
+**The wider lesson.** "Why it is slow" below derives a per-K-step cost of 6.8 µs fixed + 0.086 µs
+per column and attributes the fixed part to a latency-chained weight fetch. That attribution is
+what P2b tested, and P2b's failure falsifies *the fix*, so treat the fixed 6.8 µs as unexplained
+rather than as fetch latency. Any further attempt on this kernel should start from the register
+budget (`REG:255` is already the ceiling) and from instruction issue, the two resources P2b
+overran, and should not add `__syncthreads()`.
 
 ## Kernel attribution (nsys, 2,100-token prefill, 4.52 s of GPU kernel time)
 
