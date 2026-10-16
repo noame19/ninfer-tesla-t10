@@ -47,6 +47,14 @@ CODENS = [
     "GARNETSLIP",
 ]
 
+# One distinct seal count per record, so an aggregation question has a single correct total
+# that only exists if every record was read. This is the analogue of RULER's CWE/FWE tasks and is
+# the dimension a needle test cannot reach: a retrieval working set can return every individual
+# needle and still miss the blocks a count needs, and the model then answers from parametric habit
+# rather than from the context.
+SEALS = [7, 13, 3, 21, 5, 11, 17, 2, 23, 9, 15, 4]
+SEALS_TOTAL = sum(SEALS)
+
 FILLER_SENTENCES = [
     "The maintenance crew walked the service tunnel again that morning.",
     "A pressure gauge in the east hall read slightly higher than the day before.",
@@ -95,9 +103,10 @@ def build_body(target_tokens: int, covert_marker: str) -> str:
         if index % max(step // 900, 1) == 0 and len(paragraphs) < len(CODENS):
             name = CODENS[len(paragraphs)]
             ordinal = len(paragraphs) + 1
+            seals = SEALS[ordinal - 1]
             paragraph += (
                 f" {covert_marker} {ordinal}: the codename issued for this case "
-                f"was {name}."
+                f"was {name}, and {seals} seals were recorded against it."
             )
         paragraphs.append(paragraph)
         built += len(paragraph) + 1
@@ -138,7 +147,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--prefix-tokens", type=int, default=0,
                         help="override the prefix size (default: budget - novel - slack)")
-    parser.add_argument("--questions", default="needle,synthesis",
+    parser.add_argument("--questions", default="needle,synthesis,aggregation",
                         help="comma list of question kinds to ask")
     parser.add_argument("--marker", default="Case number")
     parser.add_argument("--min-eviction", type=float, default=0.5,
@@ -194,6 +203,16 @@ def main() -> int:
             "Answer with just the codenames.",
             list(CODENS),
         ))
+    if "aggregation" in kinds:
+        # The total exists nowhere in the transcript: every record has to be read and its count
+        # added. A short answer budget would hide the result behind a truncated <think>, so this
+        # question is scored on a number search rather than a prefix match.
+        questions.append((
+            "aggregation-sum",
+            "How many seals were recorded across all twelve case records in total? "
+            "Answer with just the number.",
+            [str(SEALS_TOTAL)],
+        ))
 
     # The first request pays the prefill; every later one shares the prefix.
     total_prefill = 0.0
@@ -208,17 +227,24 @@ def main() -> int:
         if index == 0:
             total_prefill = wall
         text = result.get("content") or ""
-        hit = [name for name in expected if name in text]
+        # A thinking model emits its reasoning inline. Scoring the whole string lets a number that
+        # merely appears in the reasoning count as an answer, so the answer is taken from after the
+        # last closing tag; the raw text is still printed for inspection.
+        answer = text.split("</think>")[-1] if "</think>" in text else text
+        if not answer.strip():
+            answer = text
+        hit = [name for name in expected if name in answer]
         # An exact-match question must name the one codename; a synthesis question
         # is scored on how many of the twelve it recovered.
         if len(expected) == 1:
             verdict = "HIT" if hit else "MISS"
         else:
             verdict = f"{len(hit)}/{len(expected)}"
-        print(f"[{label:14s}] {wall:7.1f}s  {verdict}")
-        print(f"    answer: {text[:160].replace(chr(10), ' ')!r}")
+        print(f"[{label:18s}] {wall:7.1f}s  {verdict}")
+        # Report what was scored, so a miss can be told apart from a truncated generation.
+        print(f"    scored: {answer.strip()[:120]!r}")
         if len(expected) > 1:
-            missing = [name for name in expected if name not in text]
+            missing = [name for name in expected if name not in answer]
             print(f"    missing: {', '.join(missing) if missing else '(none)'}")
     print()
     print(f"first request (the prefill) {total_prefill:.1f}s; later requests reused it")
