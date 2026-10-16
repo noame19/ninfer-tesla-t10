@@ -65,16 +65,21 @@ NOVEL_SENTENCE = (
     "noting the water damage along the spine of each volume."
 )
 
+# MEASURED, not guessed: the server reported prompt 2,646 for a 16,093-char body and 7,938 for
+# 48,277 chars, i.e. 0.1644 both times. An earlier version of this file assumed 0.305 and so built a
+# prefix that came out at 3,633 tokens against an 8,192 budget -- under budget, meaning KVMem evicted
+# nothing, every arm saw the whole context, and five questions "passed" without testing anything.
+# Never size the filler from an assumed ratio; --show-prompt-tokens re-checks it against the server.
+FILLER_TOKENS_PER_CHAR = 0.1644
 
-def approx_tokens(text: str, tokens_per_char: float) -> int:
+
+def approx_tokens(text: str, tokens_per_char: float = FILLER_TOKENS_PER_CHAR) -> int:
     return int(len(text) * tokens_per_char)
 
 
 def build_body(target_tokens: int, covert_marker: str) -> str:
     """Build the middle of the prompt and plant the codenames at spread positions."""
-    # 0.305 tokens/char is the measured ratio for this filler text under the
-    # artifact's tokenizer; close enough to aim a prompt at a token budget.
-    target_chars = int(target_tokens / 0.305)
+    target_chars = int(target_tokens / FILLER_TOKENS_PER_CHAR)
     paragraphs = []
     # Twelve evenly spread insertion points, then one codename each in order.
     step = max(target_chars // (len(CODENS) + 1), 400)
@@ -136,6 +141,10 @@ def main() -> int:
     parser.add_argument("--questions", default="needle,synthesis",
                         help="comma list of question kinds to ask")
     parser.add_argument("--marker", default="Case number")
+    parser.add_argument("--min-eviction", type=float, default=0.5,
+                        help="refuse to run unless this fraction of the transcript is evicted; "
+                             "a prefix that fits in the budget tests nothing, because KVMem "
+                             "then keeps every page and the model sees the whole context")
     args = parser.parse_args()
 
     # Keep the prefix under the context window; the remainder is headroom for the
@@ -143,7 +152,8 @@ def main() -> int:
     if args.prefix_tokens:
         prefix_tokens = args.prefix_tokens
     else:
-        prefix_tokens = max(args.budget - 1500, 4000)
+        # Aim well past the budget so the eviction actually happens.
+        prefix_tokens = max(int(args.budget / (1.0 - args.min_eviction)) + 512, args.budget + 4096)
 
     body = build_body(prefix_tokens, args.marker)
     prefix = (
@@ -151,7 +161,17 @@ def main() -> int:
         + body
         + "\n\nEnd of transcript.\n"
     )
-    print(f"prefix: {len(prefix):,} chars ~= {approx_tokens(prefix, 0.305):,} tokens")
+    estimate = approx_tokens(prefix)
+    evicted = 1.0 - (args.budget / max(estimate, 1))
+    print(f"prefix: {len(prefix):,} chars ~= {estimate:,} tokens "
+          f"({FILLER_TOKENS_PER_CHAR} tok/char, measured)")
+    print(f"budget {args.budget:,} -> evicting ~{evicted * 100:.0f}% of the transcript")
+    if evicted < args.min_eviction:
+        print(f"\nREFUSING: eviction {evicted * 100:.0f}% < --min-eviction "
+              f"{args.min_eviction * 100:.0f}%. A prefix that fits inside the budget keeps every "
+              f"page, so every question passes without retrieval doing any work and the run proves "
+              f"nothing. Raise --prefix-tokens (or lower --budget) and re-run.", file=sys.stderr)
+        return 2
     print(f"planted {len(CODENS)} codenames as numbered case records")
     print()
 
