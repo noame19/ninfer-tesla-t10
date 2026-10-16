@@ -67,25 +67,35 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
+    // Turing's single 64 KiB SM admits one stage and, of the two shapes, the eight-warp one only
+    // when the value plane is packed (58,880 B against 66,560 B); four warps fits either way.
+    constexpr int Stages   = kCausalPromptI8FastStages;
+    constexpr bool WideFit = CausalPromptI8FastShape<8, PackedValues, Stages>::SmemBytes <=
+                             kCausalPromptI8FastSmemLimit;
+    if constexpr (WideFit) {
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(
+                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys,
+                                                       Stages>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                CausalPromptI8FastShape<8, PackedValues, Stages>::SmemBytes);
+        });
+    }
     configure_cuda_device_once([] {
         return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
+            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys,
+                                                   Stages>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
-    });
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<4, PackedValues>::SmemBytes);
+            CausalPromptI8FastShape<4, PackedValues, Stages>::SmemBytes);
     });
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const auto launch = [&]<int Warps>() {
-        using Shape = CausalPromptI8FastShape<Warps, PackedValues>;
+        using Shape = CausalPromptI8FastShape<Warps, PackedValues, Stages>;
         const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
                         static_cast<unsigned>(Geometry::QHeads), 1u);
-        causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues, Keys>
+        causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues, Keys,
+                                               Stages>
             <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::int8_t*>(cache.k_pages.data),
@@ -95,7 +105,9 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     };
-    if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
+    if constexpr (!WideFit) {
+        launch.template operator()<4>();
+    } else if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
         launch.template operator()<4>();
     } else {
         launch.template operator()<8>();

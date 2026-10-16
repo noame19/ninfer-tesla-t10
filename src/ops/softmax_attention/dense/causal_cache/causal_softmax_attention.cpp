@@ -423,7 +423,19 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
     // 64 KiB before Q, P and the scales, and no tile shape fits. Only the small-T kernels, whose
     // arena is 32 KiB, fit, so every branch that would take the prompt route falls back to the
     // chunked small-T route, which splits a wide prefill into 8-token chunks.
-    constexpr CausalAttentionRoute kPromptFallback = CausalAttentionRoute::ChunkedSmallT;
+    //
+    // The fast INT8 prompt kernel (prompt_i8_fast.cuh) does fit once its arena is single-buffered:
+    // 8 warps at 58,880 B with packed values, or 4 warps at 50,176 B. It is still not the default,
+    // because that fits fewer warps per SM than the chunked route it would replace -- 8 against 12
+    // -- and its per-CTA sweep is what bounds a prefill. NINFER_PROMPT_ROUTE=1 selects it anyway,
+    // which is how the two are compared; it must be paired with --fast-prefill-kernel, since the
+    // general prompt kernel's 93,184-byte arena does not fit either.
+    static const bool prompt_route_enabled = [] {
+        const char* value = std::getenv("NINFER_PROMPT_ROUTE");
+        return value != nullptr && value[0] == '1';
+    }();
+    const CausalAttentionRoute kPromptFallback =
+        prompt_route_enabled ? CausalAttentionRoute::Prompt : CausalAttentionRoute::ChunkedSmallT;
 #else
     constexpr CausalAttentionRoute kPromptFallback = CausalAttentionRoute::Prompt;
 #endif

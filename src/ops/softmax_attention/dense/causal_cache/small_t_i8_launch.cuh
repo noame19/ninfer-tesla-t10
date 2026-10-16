@@ -205,7 +205,14 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             launch.template operator()<12, 1, 64, true>();
 #endif
         } else {
-            launch.template operator()<6, 2, 32, false>();
+            // The longest windows: 12 warps and one CTA per SM, the tier every route table gives
+            // this window. A 6x2x32 launch cannot place a second CTA -- the arena is 4*32*256 =
+            // 32 KiB of dynamic shared memory on top of 16,448 B of static against Turing's
+            // 65,536 B per SM -- so MinBlocksPerSm=2 only spends registers on a residency that
+            // never happens, and six warps per SM run where twelve fit. Measured on the T10 this
+            // fallback is what a profile-less long-context prefill takes, and it is the same loss
+            // the w6/w7/w8 route entries carried before db404f24 moved them off 6x2x32qe.
+            launch.template operator()<12, 1, 32, true, 2, true>();
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {

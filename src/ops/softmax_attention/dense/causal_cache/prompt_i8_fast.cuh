@@ -64,13 +64,20 @@ inline constexpr int kCausalPromptI8FastStageBytes = CausalPromptI8FastStage<fal
 
 // Each warp owns 16 query rows. Eight warps fill an SM's register file; four warps serve
 // launches too narrow to occupy every SM with 128-row CTAs.
-template <int Warps, bool PackedValues = false>
+//
+// Stages is the number of K/V tiles held at once. Two (the default) double-buffers the tile load
+// under the previous tile's math; one holds a single tile, which costs a barrier between a tile's
+// PV and the next tile's copy but saves one whole stage of shared memory -- the difference between
+// fitting and not fitting in Turing's 64 KiB per SM (sm_75: 16,384 + 26,112 = 42,496 B for four
+// warps at one stage, against 100,352 B for eight warps at two).
+template <int Warps, bool PackedValues = false, int Stages = 2>
 struct CausalPromptI8FastShape {
     static_assert(Warps == 4 || Warps == 8);
+    static_assert(Stages == 1 || Stages == 2);
     static constexpr int Threads   = Warps * 32;
     static constexpr int Br        = Warps * 16;
     static constexpr int QBytes    = Br * kCausalPromptHeadDim;
-    static constexpr int SmemBytes = QBytes + 2 * CausalPromptI8FastStage<PackedValues>::Bytes;
+    static constexpr int SmemBytes = QBytes + Stages * CausalPromptI8FastStage<PackedValues>::Bytes;
 };
 
 // A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
@@ -82,6 +89,19 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
 static_assert(CausalPromptI8FastShape<8>::SmemBytes == 100352);
+
+// How many K/V stages the fast prompt kernel holds at once, and the shared memory an SM can give
+// it. Ampere and newer fit the two-stage arena; Turing has 64 KiB per SM, where 100,352 B at eight
+// warps does not fit and the kernel runs single-buffered: 58,880 B at eight warps with packed
+// values, 50,176 B at four warps either way. A single stage has to publish before the next tile's
+// copy starts, so it is only the right shape where the wider four-warp one cannot reach the SMs.
+#if defined(NINFER_SM75)
+inline constexpr int kCausalPromptI8FastStages    = 1;
+inline constexpr int kCausalPromptI8FastSmemLimit = 65536;
+#else
+inline constexpr int kCausalPromptI8FastStages    = 2;
+inline constexpr int kCausalPromptI8FastSmemLimit = 232448;
+#endif
 
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
@@ -144,9 +164,9 @@ __device__ __forceinline__ void causal_prompt_i8_fast_decode_v_quad(unsigned cod
 }
 
 template <typename Geometry, typename Metadata, int Warps, bool PackedValues = false,
-          KvKeyCoding Keys = KvKeyCoding::Int8>
+          KvKeyCoding Keys = KvKeyCoding::Int8, int Stages = 2>
 __global__ __launch_bounds__(
-    CausalPromptI8FastShape<Warps, PackedValues>::Threads,
+    CausalPromptI8FastShape<Warps, PackedValues, Stages>::Threads,
     1) void causal_attention_prompt_i8_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                                    const std::int8_t* __restrict__ cache_k,
                                                    const std::int8_t* __restrict__ cache_v,
@@ -158,7 +178,7 @@ __global__ __launch_bounds__(
                                                    std::int32_t width) {
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int DB16          = D / 2;
-    using Shape                 = CausalPromptI8FastShape<Warps, PackedValues>;
+    using Shape                 = CausalPromptI8FastShape<Warps, PackedValues, Stages>;
     using Stage                 = CausalPromptI8FastStage<PackedValues>;
     constexpr int VGroups       = Stage::VGroups;
     constexpr int VRowBytes     = Stage::VRowBytes;
@@ -255,7 +275,7 @@ __global__ __launch_bounds__(
     }
 
     const auto stage_base = [&](int stage) {
-        return smem_raw + Shape::QBytes + stage * Stage::Bytes;
+        return smem_raw + Shape::QBytes + (Stages == 2 ? stage : 0) * Stage::Bytes;
     };
 
     constexpr int KChunks          = Bc * (D / 16);
@@ -669,16 +689,32 @@ __global__ __launch_bounds__(
     };
 
     // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's math.
+    //
+    // With a single stage there is nothing to overlap with, so the next tile's copy has to wait
+    // for this tile's PV to finish reading the buffer: an extra barrier before it. Turing has no
+    // cp.async (memory.cuh's stand-in is a synchronous copy), so on that part the double-buffered
+    // variant never overlapped the load with the math either -- it only ever hid the load behind
+    // the *other* stage's occupancy, which single-stage gives up for a third of the shared memory.
     issue_tile(0);
     commit_keys(0);
 #pragma unroll 1
     for (int kb = 0; kb < key_blocks; ++kb) {
         cp_wait<0>();
         __syncthreads();
-        if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
-        qk_softmax(kb);
-        pv(kb);
-        if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
+        if constexpr (Stages == 2) {
+            if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
+            qk_softmax(kb);
+            pv(kb);
+            if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
+        } else {
+            qk_softmax(kb);
+            pv(kb);
+            if (kb + 1 < key_blocks) {
+                __syncthreads();
+                issue_tile(kb + 1);
+                commit_keys(kb + 1);
+            }
+        }
     }
 
     running_l0         = warp_sum<4>(running_l0, FullMask);
