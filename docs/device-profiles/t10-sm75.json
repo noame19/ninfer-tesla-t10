@@ -5,16 +5,128 @@
   {
    "hardware_class": "nvidia-tesla-t10-sm75",
    "multiprocessors": 56,
-   "origin": "hand-written T10 profile, measured 2026-10-13: attention launch tiers for sm_75 plus the two-stage GDN prefill route; 2026-10-15: the w6/w7/w8 tiers past 8192 keys moved from 6x2x32qe to 12x1x32qe (a 6x2 tier cannot place two CTAs per SM: 16,448 static + 32,768 dynamic = 49,216 B)",
+   "origin": "hand-written T10 profile, measured 2026-10-13: attention launch tiers for sm_75 plus the two-stage GDN prefill route; 2026-10-15: the w6/w7/w8 tiers past 8192 keys moved from 6x2x32qe to 12x1x32qe (a 6x2 tier cannot place two CTAs per SM: 16,448 static + 32,768 dynamic = 49,216 B); 2026-10-16: every INT8-family key named (only rk4v4-e8 was, so rk8v4/int8/rk4v4/rk2v4-e8 -- and the server default -- fell through to the compiled 6x2 long-window tier), and w1..w5 moved off their x2 tiers onto the x1 tiers measured on the same architecture",
    "routes": {
-    "attn_i8_small/h24/rk4v4-e8/w1": [
+    "attn_i8_small/h24/int8/w1": [
      [
       65536,
-      "4x2x32e"
+      "16x1x32e"
      ],
      [
       1048576,
-      "8x2x32e"
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w2": [
+     [
+      8192,
+      ""
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w3": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w4": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w5": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w6": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w7": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/int8/w8": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w1": [
+     [
+      65536,
+      "16x1x32e"
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w2": [
+     [
+      8192,
+      ""
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w3": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w4": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w5": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w6": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w7": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk2v4-e8/w8": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4-e8/w1": [
+     [
+      65536,
+      "16x1x32e"
+     ],
+     [
+      1048576,
+      "16x1x32e"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w2": [
@@ -24,33 +136,25 @@
      ],
      [
       1048576,
-      "4x2x32e"
+      "16x1x32e"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w3": [
      [
       1048576,
-      "4x2x32qe"
+      "16x1x32"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w4": [
      [
-      8192,
-      "16x1x32"
-     ],
-     [
       1048576,
-      "4x2x32qe"
+      "16x1x32"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w5": [
      [
-      8192,
-      "16x1x32"
-     ],
-     [
       1048576,
-      "4x2x32qe"
+      "16x1x32"
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w6": [
@@ -66,6 +170,118 @@
      ]
     ],
     "attn_i8_small/h24/rk4v4-e8/w8": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w1": [
+     [
+      65536,
+      "16x1x32e"
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w2": [
+     [
+      8192,
+      ""
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w3": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w4": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w5": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w6": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w7": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk4v4/w8": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w1": [
+     [
+      65536,
+      "16x1x32e"
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w2": [
+     [
+      8192,
+      ""
+     ],
+     [
+      1048576,
+      "16x1x32e"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w3": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w4": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w5": [
+     [
+      1048576,
+      "16x1x32"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w6": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w7": [
+     [
+      1048576,
+      "12x1x32qe"
+     ]
+    ],
+    "attn_i8_small/h24/rk8v4/w8": [
      [
       1048576,
       "12x1x32qe"
