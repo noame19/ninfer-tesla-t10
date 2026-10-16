@@ -26,9 +26,12 @@ struct ResolvedExecutionOptions {
     ThinkingControlOptions thinking;
     // Gather each generated token's log probability and its likely alternatives.
     bool logprobs = false;
+    // Engine-assigned publication order; never supplied by an external client.
+    std::uint64_t publication_order = 0;
 };
 
 struct ResolvedRequestOptions {
+    ToolChoice tool_choice;
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;

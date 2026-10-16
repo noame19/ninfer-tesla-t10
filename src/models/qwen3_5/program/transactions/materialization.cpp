@@ -341,11 +341,14 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             .base                  = request_plan.reuse == ReusePath::Root ? 0U : request_plan.reuse_base,
             .cursor                = request_plan.reuse == ReusePath::Root ? 0U : request_plan.reuse_base,
             .disk_restore_frontier = request_plan.disk_restore_frontier,
+            .memory_restore_frontier = request_plan.memory_restore_frontier,
+            .memory_restore_generation = request_plan.memory_restore_generation,
             .prompt_tokens      = prompt_tokens,
             .initial_mtp_extent = initial_mtp_extent,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = request_plan.prepare_mtp,
             .reuse              = request_plan.reuse,
+            .reported_reuse_path = request_plan.summary.prefix_reuse_path,
             .mtp_bridge         = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
@@ -2271,6 +2274,10 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
     // This is the unique physical publication point. ResourceManager still owns the logical
     // catalog capabilities and adopts them only after validating this terminal result.
+    if (!prepare_memory_materialization(transaction)) {
+        out.status = runtime::ContextTransactionStatus::InProgress;
+        return out;
+    }
     try {
         out.published.emplace(start_request(transaction));
         materialization_ledger_.clear();
@@ -2376,6 +2383,11 @@ bool ProgramImpl::vision_pending(SequenceHandle sequence) const noexcept {
 }
 
 bool ProgramImpl::wait_context_transfer() noexcept {
+    if (memory_io && memory_io->pending_jobs()) {
+        const auto epoch = memory_io->completion_epoch();
+        memory_io->wait_for_completion(epoch, std::chrono::milliseconds(1));
+        return true;
+    }
     bool submitted = false;
     if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
         submitted = transaction->transfer_submitted;

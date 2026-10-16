@@ -95,3 +95,6 @@ third_party/webui/
 # fill the root filesystem.
 /build-sm75
 /.ccache
+
+# Local measurement output (analysis runs, logs, profiles)
+.perf-out/

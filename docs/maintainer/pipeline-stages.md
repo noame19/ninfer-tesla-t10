@@ -15,9 +15,9 @@ each stage read its weights once per micro-batch and win nothing.
 **It is not tensor parallelism.** No layer is divided across devices, so no collective runs inside a
 layer.
 
-**Multi-GPU is a Linux feature.** Repeating one device id (`--devices 0,0`) exercises the whole
-stage path on a single card and is accepted everywhere, which is how the path is tested without a
-second GPU. Distinct ids are refused on Windows.
+**This KVMem branch enables native Windows as well as Linux.** Repeating one device id
+(`--devices 0,0`) remains useful for single-card stage tests. Physical-device qualification must
+also use distinct ids; identical compute capability is required by `DeviceContext`.
 
 ## How it works
 
@@ -60,7 +60,7 @@ second GPU. Distinct ids are refused on Windows.
   (`ScopedDeviceRank`, `ScopedArenaRank`), receives the residual and control block, runs the stage's
   layers and passes the residual on.
 
-## What is not covered yet
+## KVMem Host history and selection
 
 - **Prefill does not overlap stages.** A prefill chunk runs through the stages in turn and the
   engine synchronizes after each chunk, so at any moment one stage is busy. Overlapping stages needs

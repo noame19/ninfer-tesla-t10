@@ -784,6 +784,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
 }
 
 void lower_tools(const Json& body, GenerationRequest& request) {
+    parse_tool_constraints(body, request);
     const ToolSelection selection       = parse_tool_choice(body);
     std::vector<ParsedTool> definitions = parse_tool_definitions(body);
     const auto named                    = [&](const ParsedTool& tool) {
@@ -803,6 +804,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
+                tool.definition.strict = tool.strict;
                 request.tools.push_back(std::move(tool.definition));
             }
         }
@@ -820,11 +822,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
+        tool.definition.strict = tool.strict;
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -840,19 +838,13 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         request.tools.push_back(std::move(tool.definition));
     }
 
-    // A forced choice is executed by writing the call opener into the generation prompt, and that
-    // opener carries the tool name. `any` over several tools leaves the name to the model, which
-    // NInfer cannot constrain, so it is advisory: the tools stay offered under automatic selection.
-    // Qwen Code sends it for every JSON side query (permission classifier, session title,
-    // next-speaker check), which a 400 would break.
+    // Anthropic named choices can repeat the selected tool unless parallel use is disabled.
     if (selection.kind == ToolSelectionKind::Named) {
         request.tool_choice.forced_name = selection.name;
-    } else if (selection.kind == ToolSelectionKind::Any && request.tools.size() == 1) {
-        request.tool_choice.forced_name = request.tools.front().name;
+    } else if (selection.kind == ToolSelectionKind::Any) {
+        request.tool_choice.mode = ToolChoiceMode::Required;
     }
 
-    // Honoured as parallel_tool_calls=false is on the OpenAI endpoints: decoding is not
-    // constrained, so the response keeps the first call and drops the rest.
     if (selection.disable_parallel) { request.parallel_tool_calls = false; }
 }
 

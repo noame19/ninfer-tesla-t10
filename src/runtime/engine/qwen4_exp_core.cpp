@@ -2148,7 +2148,7 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
         impl_->instance.frontend.thinking_control_token_count());
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
-        options.execution.structured_output);
+        options.execution.structured_output, options.tool_choice);
     const std::optional<std::uint32_t> budget = request->output.thinking_stats().effective_budget;
     request->prompt                           = std::move(prompt);
     request->options                          = std::move(options);

@@ -45,6 +45,7 @@ struct ExecutionCore {
     ops::RopeYarn rope_yarn;
     bool fast_prefill_kernel = false;
     std::uint32_t mtp_attention_window = 0;
+    const MemoryStatistics* memory_statistics = nullptr;
 };
 
 // The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,
@@ -87,6 +88,7 @@ struct PrefillContext {
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
     // immediately before its pass and nothing outside the chunk call can hold the view.
     std::function<std::span<const cudaEvent_t>()> take_layer_ready;
+    std::uint32_t cache_position_shift = 0;
 };
 
 struct OrdinaryBatchContext {

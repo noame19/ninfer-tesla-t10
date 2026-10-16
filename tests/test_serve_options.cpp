@@ -2,9 +2,12 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <limits>
 
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,12 +27,17 @@ ServeOptions parse(std::vector<std::string> arguments) {
     std::vector<char*> argv;
     argv.reserve(arguments.size());
     for (std::string& argument : arguments) { argv.push_back(argument.data()); }
-    return parse_serve_options(static_cast<int>(argv.size()), argv.data());
+    try { return parse_serve_options(static_cast<int>(argv.size()), argv.data()); }
+    catch (const std::invalid_argument& error) {
+        std::string context = error.what();
+        for (const auto& argument : arguments) context += " [" + argument + "]";
+        throw std::invalid_argument(context);
+    }
 }
 
 } // namespace
 
-int main() {
+int run_serve_option_tests() {
     int failures = 0;
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p == 0,
                       "draft confidence must be opt-in");
@@ -98,7 +106,6 @@ int main() {
     for (const auto& tail : std::vector<std::vector<std::string>>{
              {"--ngram-draft-tokens", "64"},
              {"--ngram-min-match", "3"},
-             {"--max-concurrency", "2", "--ngram-draft-tokens", "63"},
              {"--spec", "none"}}) {
         std::vector<std::string> arguments{"ninfer-serve",
                                            "model.ninfer",
@@ -134,15 +141,11 @@ int main() {
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.ngram_draft_tokens == 0,
                       "ngram default needs a neural backend");
-    const auto mtp_wide_concurrent = [&] {
-        bool rejected = false;
-        try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
-                         "--ngram-draft-tokens", "63", "--max-concurrency", "4"});
-        } catch (const std::invalid_argument&) { rejected = true; }
-        return rejected;
-    }();
-    failures += check(mtp_wide_concurrent, "wide MTP ngram with concurrency>1 was admitted");
+    const auto mtp_wide_concurrent = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                                          "--ngram-draft-tokens", "63", "--max-concurrency", "4"});
+    failures += check(mtp_wide_concurrent.speculative.ngram_draft_tokens == 15 &&
+                      mtp_wide_concurrent.requested_ngram_draft_tokens == 63,
+                      "wide MTP ngram was not reduced with an adjustment record");
 
     const auto mtp_ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
@@ -181,14 +184,12 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
-        // The GDN conv-record workspace caps a multi-request verify at 16 columns, so any backend
-        // rejects an ngram width above 15 once concurrency exceeds one.
-        bool wide_rejected = false;
-        try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
-                         "--ngram-draft-tokens", "63", "--max-concurrency", "2"});
-        } catch (const std::invalid_argument&) { wide_rejected = true; }
-        failures += check(wide_rejected, "wide ngram with concurrency>1 admitted");
+        // Wider valid requests use the 16-column GDN verification frame at multi-request startup.
+        const auto wide_concurrent = parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                                             "--ngram-draft-tokens", "63", "--max-concurrency", "2"});
+        failures += check(wide_concurrent.speculative.ngram_draft_tokens == 15 &&
+                          wide_concurrent.requested_ngram_draft_tokens == 63,
+                          "wide ngram was not reduced for concurrent execution");
         const auto wide_single =
             parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
@@ -1633,4 +1634,12 @@ int main() {
     }
 
     return failures == 0 ? 0 : 1;
+}
+
+int main() {
+    try { return run_serve_option_tests(); }
+    catch (const std::exception& error) {
+        std::cerr << "SERVE_OPTIONS unexpected exception: " << error.what() << std::endl;
+        return 1;
+    }
 }

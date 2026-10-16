@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -245,6 +246,8 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
             auto bytes = reader.read_object(placement.object);
             if (writer_fixture && reader.directory().tensor(placement.object).id == "matrix") {
                 require(bytes.size() == 130 * 130 * 2, "Python writer changed tensor dimensions");
+            }
+            if (writer_fixture) {
                 for (std::size_t i = 0; i < bytes.size(); ++i) {
                     require(bytes[i] == std::byte((i * 37 + 11) % 251),
                             "C++ reading differs from known Python writer input bytes");
@@ -342,7 +345,7 @@ void staging_reuse(DeviceContext& device) {
 // per-rank upload stream, exercised without a second GPU. A repeated device id is supported for
 // exactly this reason -- it frees no memory, but every placement and transfer path is the real one.
 void pipeline_rank_placement() {
-    const std::array<int, 2> ids{0, 0};
+    const std::array<int, 2> ids{0, std::getenv("NINFER_TEST_DEVICE_IDS") ? 1 : 0};
     DeviceContext split{std::span<const int>(ids)};
     Fixture fixture;
     fixture.write(true);
@@ -373,9 +376,36 @@ void pipeline_rank_placement() {
     require(backing.device_parent(matrix).data != backing.device_parent(divisors).data,
             "both ranks were served from one allocation");
     std::vector<std::byte> actual(expected.size());
-    CUDA_CHECK(cudaMemcpy(actual.data(), backing.device_parent(divisors).data, actual.size(),
-                          cudaMemcpyDeviceToHost));
+    {
+        const HoldingDeviceBinding bound(memory_device(backing.device_parent(divisors).data));
+        CUDA_CHECK(cudaMemcpy(actual.data(), backing.device_parent(divisors).data, actual.size(),
+                              cudaMemcpyDeviceToHost));
+    }
     require(actual == expected, "the offloaded rank received the wrong bytes");
+
+    {
+        Binder shared(reader);
+        auto reference = shared.parameter("values", {2}, Residency::Device, QType::FP32);
+        shared.replicate_device(divisors, 1);
+        shared.replicate_device(divisors, 1);
+        const auto replicated_plan = std::move(shared).finish();
+        require(replicated_plan.device_objects.size() == 2 &&
+                    replicated_plan.device_capacity(0) == 8 &&
+                    replicated_plan.device_capacity(1) == 8,
+                "shared auxiliary replicas were duplicated within a rank");
+        const auto replicated = materialize(reader, MaterializationPlan(replicated_plan), split);
+        const auto* primary = replicated.device_parent(divisors).data;
+        reference.device_replica = 1;
+        const auto* secondary = bind_view(reference, replicated).parts[0].parent->data;
+        require(primary != secondary && memory_device(primary) == ids[0] &&
+                    memory_device(secondary) == ids[1],
+                "replica binding addressed a different physical device");
+        for (const auto* pointer : {primary, secondary}) {
+            const HoldingDeviceBinding bound(memory_device(pointer));
+            CUDA_CHECK(cudaMemcpy(actual.data(), pointer, actual.size(), cudaMemcpyDeviceToHost));
+            require(actual == expected, "shared auxiliary copy changed its encoded bytes");
+        }
+    }
 
     {
         Binder rejected(reader);
@@ -388,6 +418,20 @@ void pipeline_rank_placement() {
         rejected.device_rank(divisors, 1);
         rejects([&] { rejected.device_rank(divisors, 0); },
                 "one object was accepted on two different devices");
+    }
+    {
+        // Overlay Vision with a layer split: the evictable tail is rank 0's alone and a later
+        // stage's resident weights are planned on their own arena, neither shifting nor joining it.
+        Binder overlay(reader);
+        (void)overlay.parameter("matrix", {2, 130});
+        overlay.device_rank(matrix, 1);
+        overlay.require_device(divisors);
+        overlay.evict_device(divisors, 700);
+        const auto overlay_plan = std::move(overlay).finish(EvictableWeightPool::kChunkBytes);
+        require(overlay_plan.device_rank_count() == 2 && overlay_plan.evictable_tail_offset == 0 &&
+                    overlay_plan.evictable_tail_bytes == 8 &&
+                    overlay_plan.device_capacity(0) == 8 && overlay_plan.device_capacity(1) == 528,
+                "an evictable tail and a later stage's weights were not planned per rank");
     }
     {
         // An offloaded rank holds expert blocks and nothing a Vision window could borrow, so the
@@ -425,6 +469,9 @@ int main(int argc, char** argv) {
         failure_and_host_only(device);
         overlay_placement(device);
         pipeline_rank_placement();
+        // The temporary context releases its last device's streams; resume this context before
+        // creating staging events on its stream.
+        device.bind_to_current_thread();
 #if defined(NINFER_TEST_LINK_WRAP)
         ninfer::test::materialization_cuda_errors(device);
 #else

@@ -5,6 +5,11 @@
 #include "core/arena.h"
 #include "core/device_snapshot.h"
 #include "core/vmm.h"
+#include "kvmem/memory_contract.hpp"
+#include "kvmem/raw_kv_store.hpp"
+#include "kvmem/kvmem_store.hpp"
+#include "kvmem/mean_key_retrieval.hpp"
+#include "kvmem/spill_io.hpp"
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
@@ -205,6 +210,7 @@ struct CaptureAssessmentImpl {
 };
 
 struct RequestBasePlanImpl {
+    std::uint64_t memory_payload_reservation = 0, publication_order = 0;
     runtime::RequestPlanSummary summary;
     detail::PhysicalDemand root_demand;
     runtime::PrefillWork root_rebuild_work;
@@ -223,6 +229,7 @@ struct RequestBasePlanImpl {
     qwen3_5::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    bool allow_memory_reuse = false;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -272,6 +279,7 @@ struct ResourceCandidateState {
 };
 
 struct AdmissionCandidateImpl : ResourceCandidateState {
+    std::uint64_t memory_payload_reservation = 0, publication_order = 0;
     MtpBridgeMode mtp_bridge = MtpBridgeMode::None;
     bool prepare_mtp         = false;
     std::optional<VisionPrefillPlan> vision;
@@ -288,6 +296,9 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t root_rebuild_tail_begin = 0;
     // A root whose prefix [0, frontier) the disk tier can restore; zero otherwise.
     std::uint32_t disk_restore_frontier   = 0;
+    std::uint32_t memory_restore_frontier = 0;
+    std::uint64_t memory_restore_generation = 0;
+    bool allow_memory_reuse = false;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
     std::optional<std::uint32_t> graft_shared_slot_index;
@@ -458,6 +469,127 @@ struct DecodeGraphFamily {
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
+struct KvmemPrefixCheckpoint {
+    kvmem::LrfuState history;
+    kvmem::CheckpointIdentity identity;
+    std::vector<TokenId> prefix;
+    ResidentPrefixIdentity prefix_identity;
+    std::vector<std::uint64_t> resident_pages;
+    std::vector<float> mean_tail;
+    std::shared_ptr<PinnedHostBuffer> state;
+    // Idle-only attachment in the same disk account as native KV. Active
+    // checkpoints use the existing pinned representation and GPU copy path.
+    kvmem::SpillExtent cold_state;
+    std::uint64_t state_bytes() const noexcept { return state ? state->size() : cold_state.size(); }
+};
+
+enum class KvmemCheckpointKind : std::uint8_t { Base, Endpoint, InputFallback, Reconstruction };
+// Lookup priority for equal frontiers.
+inline constexpr std::array kKvmemCheckpointKinds{
+    KvmemCheckpointKind::Endpoint, KvmemCheckpointKind::Reconstruction,
+    KvmemCheckpointKind::InputFallback, KvmemCheckpointKind::Base};
+struct KvmemHistoryMatch {
+    std::size_t history;
+    KvmemCheckpointKind kind;
+    std::uint32_t frontier;
+};
+
+using KvmemHostRecord = kvmem::HostKvRecord;
+
+// CPU-only preparation owns its inputs independently of the sequence. New
+// mutable buffers are published on the engine thread before GPU append begins.
+struct KvmemAppendPreparation {
+    struct Work {
+        std::vector<std::uint32_t> ids;
+        std::vector<kvmem::HostKvSource> sources;
+        std::vector<KvmemHostRecord> records;
+    };
+    std::shared_ptr<Work> work;
+    kvmem::StorageTicket ticket;
+    ~KvmemAppendPreparation() {
+        ticket.cancel();
+        try { ticket.wait(); } catch (...) {}
+    }
+};
+
+struct KvmemHistoryPreparation {
+    struct Work {
+        kvmem::SpillExtent state_source;
+        KvmemHostRecord state;
+        std::vector<std::uint32_t> ids;
+        std::vector<kvmem::HostKvSource> sources;
+        std::vector<KvmemHostRecord> records;
+        std::vector<kvmem::HostKvLease> leases;
+    };
+    std::shared_ptr<Work> work;
+    kvmem::StorageTicket ticket;
+    std::size_t history = 0;
+    std::uint64_t generation = 0;
+    std::optional<KvmemCheckpointKind> checkpoint;
+    bool native_ready = false;
+    // Workers own only CPU buffers/leases. Cancellation can release the engine
+    // transaction while a started read safely drains its independent sources.
+    ~KvmemHistoryPreparation() { ticket.cancel(); }
+};
+
+struct KvmemIdleTransfer {
+    struct Work {
+        kvmem::SpillExtent destination;
+        const void* data = nullptr;
+        std::size_t bytes = 0;
+    };
+    // Only the engine owns this CUDA host allocation. A worker borrows its
+    // immutable bytes; this owner survives history eviction until completion.
+    std::shared_ptr<PinnedHostBuffer> source;
+    std::shared_ptr<Work> work;
+    kvmem::StorageTicket ticket;
+    std::size_t history = 0;
+    std::uint64_t generation = 0;
+    KvmemCheckpointKind kind = KvmemCheckpointKind::Base;
+};
+
+struct KvmemWindowState {
+    std::vector<TokenId> history_input;
+    ResidentPrefixIdentity history_input_identity;
+    std::vector<kvmem::LrfuPoint> history_points;
+    std::optional<PreparedSessionKey> session_key;
+    std::uint64_t publication_order = 0;
+    bool update_session_index = true;
+    // Compact execution slots -> original logical pages. Host records retain native
+    // packed data AND scales. They never contain a second allocation of device KV.
+    std::vector<std::uint32_t> pages;
+    std::vector<std::uint32_t> media_pages;
+    std::vector<KvmemHostRecord> archive;
+    std::vector<std::uint64_t> host_versions;
+    kvmem::MemoryStamp stamp;
+    std::uint64_t payload_bytes = 0;
+    std::uint64_t spilled_bytes = 0, restored_bytes = 0;
+    std::uint32_t removed_tokens = 0;
+    std::uint32_t swaps = 0;
+    std::unique_ptr<kvmem::RawKvStore> statistics;
+    std::unique_ptr<kvmem::KvMemStore> selector;
+    std::vector<float> query_sum;
+    std::uint32_t statistics_frontier = 0;
+    std::uint32_t query_tokens = 0;
+    std::uint32_t query_begin = 0, query_end = 0;
+    // Long prompts retain the pre-query boundary for selection/replay; short prompts
+    // retain the input prefix before its final token for request-to-request reuse.
+    std::unique_ptr<KvmemPrefixCheckpoint> prefix_checkpoint;
+    std::unique_ptr<KvmemPrefixCheckpoint> endpoint_checkpoint;
+    // An input fallback survives generated reconstruction captures: a caller may
+    // discard/replace the output while appending to the exact earlier input.
+    std::unique_ptr<KvmemPrefixCheckpoint> input_checkpoint;
+    std::unique_ptr<KvmemPrefixCheckpoint> reconstruction_checkpoint;
+    std::uint32_t reconstruction_frontier = 0;
+    bool query_replayed = false;
+    std::uint32_t pending_window_begin = 0, pending_window_end = 0;
+    std::uint64_t pending_io_epoch = 0;
+    std::unique_ptr<KvmemAppendPreparation> pending_append;
+    kvmem::StorageTicket pending_window_io;
+    // Last member: abort/drain the transaction before its source archive dies.
+    std::unique_ptr<kvmem::MemorySession> pending_window;
+};
+
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
     ActiveStateBinding state;
@@ -473,6 +605,7 @@ struct SequenceState {
     qwen3_5::detail::ResidentPrefixIdentity prefix_identity;
     qwen3_5::detail::PrefixShortlistDigests prefix_digests;
     std::int32_t rope_delta               = 0;
+    KvmemWindowState window;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
@@ -537,6 +670,9 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    bool allow_memory_reuse = false;
+    std::uint64_t memory_payload_reservation = 0;
+    std::optional<PreparedSessionKey> memory_session_key;
     // The sequence's own output ceiling: the largest frontier its lease may ever cover, so
     // on-demand growth never leases pages the request cannot reach.
     std::uint32_t lease_ceiling = 0;
@@ -562,12 +698,16 @@ struct RequestControl {
         // not the restore succeeds; after a failed restore the prefill recomputes [0, frontier)
         // and keeps those tokens out of its reports, so the admitted suffix stays exact.
         std::uint32_t disk_restore_frontier = 0;
+        std::uint32_t memory_restore_frontier = 0;
+        std::uint64_t memory_restore_generation = 0;
+        bool waiting_for_storage = false;
         std::uint32_t hidden_replay_tokens  = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
+        PrefixReusePath reported_reuse_path  = PrefixReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
     };
 
@@ -581,6 +721,9 @@ struct RequestControl {
         active_resources     = {};
         optional_resources   = {};
         publish_continuation = true;
+        allow_memory_reuse = false;
+        memory_payload_reservation = 0;
+        memory_session_key.reset();
         lease_settled        = false;
         lease_space_limited  = false;
         lease_minimum_target = {};
@@ -682,6 +825,11 @@ public:
     // True while this sequence waits for a media item submitted to a concurrent overlay window:
     // the lane must not be given a prefill unit, and every other lane keeps running.
     [[nodiscard]] bool vision_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool memory_pending(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool prepare_decode_memory(SequenceHandle sequence);
+    [[nodiscard]] std::uint32_t memory_control_chunk() const noexcept;
+    [[nodiscard]] bool prepare_control_memory(SequenceHandle sequence, std::uint32_t tokens);
+    [[nodiscard]] bool cancel_memory_ready(SequenceHandle sequence) noexcept;
     void update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling);
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] bool try_claim_seal_window() noexcept;
@@ -750,6 +898,7 @@ public:
     [[nodiscard]] KVEntitlementShape kv_entitlement_shape() const noexcept;
     [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+    [[nodiscard]] bool temporary_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
 
@@ -808,11 +957,24 @@ public:
     void reset_memory_peaks() noexcept;
 
     friend struct qwen3_5::detail::PressurePlanningSessionImpl;
+    friend class WindowMemoryBackend;
+    friend class WindowMemoryTransfer;
 
     const execution::Parameters& parameters;
     DeviceContext& device;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
+    const std::uint32_t kvmem_window_tokens;
+    const KvmemOptions kvmem_options;
+    kvmem::HostKvStorage memory_payload_storage;
+    kvmem::HostKvStorage memory_transfer_storage; // bounded CPU scratch through GPU publication
+    kvmem::HostKvStorage memory_state_staging; // one admitted state-image read at a time
+    // Declared before the queue: shutdown joins workers before freeing their
+    // engine-owned pinned source, even if its original history was evicted.
+    std::unique_ptr<KvmemIdleTransfer> memory_idle_transfer;
+    bool memory_idle_requested = false;
+    std::unique_ptr<kvmem::StorageIoQueue> memory_io;
+    std::uint64_t memory_retained_budget = 0; // logical payload; physical H/D remain separate
     const std::uint32_t max_concurrency;
     // Frozen context-cache shape: an engaged host budget has already resolved host_state_slots,
     // host_kv_capacity_bytes and the long-anchor count on the plan this Program was built from.
@@ -916,6 +1078,26 @@ public:
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
+    std::optional<execution::MemoryStatistics> memory_statistics;
+    std::optional<execution::MemoryStatistics> memory_candidate_statistics;
+    std::unique_ptr<PinnedHostBuffer> memory_candidate_host;
+    std::unique_ptr<PinnedHostBuffer> memory_statistics_host;
+    // Reused transfer staging is bounded by the physical window. Durable history
+    // uses ordinary host RAM, so pinned allocation count does not grow with H.
+    std::unique_ptr<PinnedHostBuffer> memory_kv_staging;
+    std::array<std::int32_t, 4> memory_statistics_ranges{};
+    // Inactive physical Host histories. Keys follow frontend ContextCacheHints;
+    // exact checkpoint identity still decides whether any bytes can be reused.
+    std::array<std::optional<KvmemWindowState>, 16> memory_histories;
+    struct MemoryPublication {
+        std::optional<PreparedSessionKey> key;
+        std::uint64_t order = 0;
+    };
+    // Bounded high-watermarks also cover newer requests that finish without
+    // retaining a checkpoint, preventing an older concurrent result publishing.
+    std::array<MemoryPublication, 32> memory_publications;
+    std::uint64_t memory_history_hits = 0, memory_history_misses = 0, memory_history_evictions = 0;
+
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
@@ -1202,6 +1384,7 @@ private:
         bool cancel_pending                 = false;
         bool prepared                       = false;
         bool terminal                       = false;
+        std::unique_ptr<KvmemHistoryPreparation> memory_history;
     };
 
     std::uint64_t next_materialization_id_ = 1;
@@ -1700,6 +1883,53 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    bool prepare_memory_append(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
+                               bool allow_pending);
+    bool prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
+                        bool force_selection = false, bool allow_pending = false);
+    void archive_memory_window(SequenceState& sequence);
+    bool memory_query_probe(const SequenceState& sequence, std::uint32_t prompt_tokens) const;
+    [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
+        std::uint32_t prompt_tokens, bool allow_reuse) const;
+    void capture_memory_prefix(SequenceState& sequence, std::uint32_t chunk_tokens);
+    std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence);
+    void capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept;
+    void capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept;
+    void capture_memory_reconstruction_if_ready(SequenceState& sequence);
+    std::unique_ptr<KvmemPrefixCheckpoint>& memory_checkpoint_slot(KvmemWindowState& window,
+                                                                KvmemCheckpointKind kind);
+    const KvmemPrefixCheckpoint* memory_checkpoint(const KvmemWindowState& window,
+                                                   KvmemCheckpointKind kind) const;
+    bool memory_same_query(const KvmemWindowState& window, const PreparedPromptData& prompt,
+                           std::uint32_t frontier) const;
+    void rewind_memory_query(SequenceState& sequence);
+    void restore_memory_prefix(SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint,
+                               bool preserve_view = false, bool allow_pending = false, bool resident_native = false);
+    bool prepare_memory_materialization(MaterializationTransaction& transaction);
+    bool progress_memory_storage();
+    bool memory_maintenance_pending() const noexcept;
+    std::optional<KvmemHistoryMatch> memory_restorable_history(const PreparedPromptData& prompt) const;
+    void reserve_memory_history(SequenceState& sequence, RequestControl& request,
+                                const PreparedPromptData& prompt);
+    bool restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged);
+    void retain_memory_history(SequenceState& sequence, const RequestControl& request) noexcept;
+    void prepare_memory_statistics(SequenceState& sequence, std::uint32_t query_begin,
+                                   std::uint32_t query_end);
+    void commit_memory_statistics(SequenceState& sequence, std::uint32_t begin,
+                                 std::uint32_t end);
+    void commit_memory_candidates(SequenceState& sequence, std::uint32_t begin,
+                                  std::uint32_t end, std::uint32_t first_column,
+                                  std::uint32_t row_width);
+    void read_memory_candidates();
+    [[nodiscard]] std::vector<std::uint32_t> memory_image_pages(const PreparedPromptData& prompt) const;
+
+    [[nodiscard]] std::uint32_t compact_position(const SequenceState& sequence,
+                                                std::uint32_t logical) const {
+        if (logical < sequence.window.removed_tokens) {
+            throw std::logic_error("position precedes compact KV append frontier");
+        }
+        return logical - sequence.window.removed_tokens;
+    }
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
 

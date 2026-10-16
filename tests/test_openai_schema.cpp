@@ -747,7 +747,7 @@ int test_messages_and_media() {
                Json::array({Json{{"type", "text"}, {"text", "captured"}},
                             Json{{"type", "image_url"},
                                  {"image_url", Json{{"url", "https://example.test/capture.png"},
-                                                    {"detail", "auto"}}}}})}}});
+                                                    {"detail", "original"}}}}})}}});
     const GenerationRequest tool_image = parse(body).generation;
     failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
                           tool_image.messages.back().tool_call_id == "call_capture" &&
@@ -1481,7 +1481,12 @@ int test_assistant_continuation_mode() {
     return failures;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--image-detail-only") {
+        const int failures = test_messages_and_media();
+        if (failures == 0) { std::cout << "OpenAI Chat image detail tests passed\n"; }
+        return failures == 0 ? 0 : 1;
+    }
     int failures = 0;
     failures += test_graft_extension();
     failures += test_thinking_budget_extension();

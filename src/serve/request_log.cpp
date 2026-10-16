@@ -1,4 +1,6 @@
 #include "serve/request_log.h"
+#include "serve/cuda_residency_json.h"
+#include "product/cuda_memory_options.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
@@ -117,6 +119,8 @@ std::string tool_choice_name(const ToolChoice& choice) {
         return "auto";
     case ToolChoiceMode::None:
         return "none";
+    case ToolChoiceMode::Required:
+        return "required";
     }
     return "unknown";
 }
@@ -802,6 +806,13 @@ std::string format_server_start_json(
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
+        {"cuda_memory_policy", product::format_cuda_memory_policy(
+             engine_options.cuda_memory_policy, engine_options.cuda_vram_reserve_bytes,
+             engine_options.cuda_memory_probe_step_bytes)},
+        {"cuda_vram_reserve_bytes", engine_options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                                       ? engine_options.cuda_vram_reserve_bytes : 0},
+        {"cuda_memory_probe_step_bytes", engine_options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                                            ? engine_options.cuda_memory_probe_step_bytes : 0},
         {"model_suspend", engine_options.suspend.enabled},
         {"suspend_snapshot",
          engine_options.suspend.snapshot_memory == SuspendSnapshotMemory::Pinned ? "pinned"
@@ -877,6 +888,7 @@ std::string format_server_start_json(
              {"greedy", options.greedy}};
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
+             {"cuda_residency", cuda_residency_json(memory.cuda_residency)},
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
              {"vision_workspace", vision_workspace_json(memory.vision_workspace)},

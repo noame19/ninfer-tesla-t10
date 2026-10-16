@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import struct
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -7,7 +10,7 @@ import torch
 from tools.artifact.formats import GGUF_FORMATS, GGUF_FORMATS_BY_TYPE
 from tools.artifact.layouts import encoded_size, gguf_blocks_geometry
 from tools.convert import gguf_blocks
-from tools.convert.sources.gguf import GGUFFile, write_gguf
+from tools.convert.sources.gguf import TYPE_BF16, GGUFFile, write_gguf
 
 TYPE_Q8_0 = 8
 
@@ -79,6 +82,34 @@ def test_rows_are_copied_byte_for_byte_through_the_row_map(tmp_path):
         assert torch.equal(
             source.read_encoded(1, 3).codes, torch.from_numpy(blocks.reshape(12, -1)[order[1:3]])
         )
+
+
+@pytest.mark.parametrize("type_id", (42, 2, 6), ids=("q2_0", "q4_0", "q5_0"))
+def test_small_blocks_preserve_rows_and_values(tmp_path, monkeypatch, type_id):
+    if type_id == 42:
+        # Q2_0 must decode even when gguf-py is absent or lacks this implementation.
+        monkeypatch.setitem(sys.modules, "gguf", None)
+    else:
+        pytest.importorskip("gguf")
+    path, blocks, values = _small_block_file(tmp_path, type_id)
+    order = np.array([3, 0, 2, 0], dtype=np.int64)
+    with GGUFFile(path) as gguf:
+        source = gguf_blocks.block_source(gguf, "w", (4, 128), lambda b, e: order[b:e])
+        encoded = source.read_encoded(1, 4)
+        assert encoded.format == GGUF_FORMATS_BY_TYPE[type_id].name
+        assert torch.equal(encoded.codes, torch.from_numpy(blocks[order[1:4]]))
+        assert torch.equal(source.rows(1, 4), torch.from_numpy(values[order[1:4]]))
+        with pytest.raises(ValueError, match="row range"):
+            gguf.read_blocks("w", 0, 5)
+
+
+def test_q2_0_gates_decode_before_grouped_bf16_cast(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "gguf", None)
+    path, _, values = _small_block_file(tmp_path, 42, rows=48)
+    grouped = values.reshape(3, 16, 128).transpose(1, 0, 2).reshape(48, 128)
+    with GGUFFile(path) as gguf:
+        source = gguf_blocks._gate_projection(gguf, "w")
+        assert torch.equal(source.rows(0, 48), torch.from_numpy(grouped.copy()).to(torch.bfloat16))
 
 
 def test_row_values_are_ggml_dequantization(tmp_path):

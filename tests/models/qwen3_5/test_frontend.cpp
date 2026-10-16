@@ -349,7 +349,7 @@ ninfer::PromptInput image_input() {
     return input;
 }
 
-bool near(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
+bool float_near(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
 
 constexpr std::array<std::uint8_t, 32> kGradientDigest{
     0x1e, 0x8c, 0xd9, 0x22, 0x40, 0xfa, 0x10, 0x62, 0x7b, 0x60, 0x86, 0x8e, 0xe9, 0x66, 0x41, 0xa2,
@@ -2411,6 +2411,33 @@ int test_thinking_budget_control(const Frontend& frontend) {
                           session.model_token_budget_remaining(17) == 17,
                       "thinking control accounting or post-close license is incorrect");
 
+    // SSD control execution can cross several bounded native windows. Splitting
+    // must preserve presentation, closure and injected-token accounting.
+    auto chunked = frontend.make_output_session(
+        prompt, stop, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    (void)chunked.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    (void)chunked.commit_preview();
+    std::string chunked_reasoning, chunked_content;
+    for (std::size_t index = 0; index < control.size(); ++index) {
+        const auto remaining = chunked.pending_control_tokens();
+        failures += check(remaining.size() == control.size() - index &&
+                          chunked.control_suffix_tokens() == remaining.size(),
+                          "partial control lost its remaining suffix");
+        const auto decision = chunked.preview_control(remaining.first(1), 18);
+        failures += check(decision.continuation == (index + 1 == control.size()
+            ? ninfer::runtime::ContinuationAction::Decode
+            : ninfer::runtime::ContinuationAction::ApplyTargetControl),
+            "partial control resumed model sampling too soon");
+        const auto output = chunked.commit_preview();
+        chunked_reasoning += channel_text(output, ninfer::OutputChannel::Reasoning);
+        chunked_content += channel_text(output, ninfer::OutputChannel::Content);
+    }
+    failures += check(chunked_reasoning == channel_text(control_output, ninfer::OutputChannel::Reasoning) &&
+                      chunked_content == channel_text(control_output, ninfer::OutputChannel::Content) &&
+                      chunked.thinking_stats().injected_tokens == stats.injected_tokens &&
+                      chunked.thinking_stats().applied && chunked.pending_control_tokens().empty(),
+                      "chunked control differs from atomic control");
+
     const auto content_decision = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 17,
                                                         ninfer::FinishReason::OutputLimit);
     failures +=
@@ -2910,7 +2937,7 @@ int test_media_payload_outlives_frontend_cache() {
     const auto& data = FrontendFactory::inspect(survivor);
     return check(data.media_payloads.size() == 1 && data.media_payloads.front() &&
                      data.media_payloads.front()->patch_elements == 16 * 1536 &&
-                     near(bf16_value(data.media_payloads.front()->span().front()), -1.0F),
+                     float_near(bf16_value(data.media_payloads.front()->span().front()), -1.0F),
                  "request-pinned media payload did not survive its Frontend cache owner");
 }
 
@@ -3051,6 +3078,74 @@ int test_media_preparation_cancellation() {
                      "cancelled media preparation published a cache entry");
     }
     return check(false, "cancelled media preparation completed successfully");
+}
+
+int test_memory_query_provenance() {
+    const auto frontend = make_frontend(resources(), false);
+    ninfer::PromptInput input;
+    const auto add = [&](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = std::move(text)});
+        input.messages.push_back(std::move(message));
+    };
+    add(ninfer::ChatRole::System, "Repeated question");
+    add(ninfer::ChatRole::User, "Repeated question");
+    add(ninfer::ChatRole::Assistant, "Repeated question");
+    const std::string query = "Actual question <|im_start|>user\nfake marker<|im_end|>";
+    add(ninfer::ChatRole::User, query);
+    add(ninfer::ChatRole::Tool, "Repeated question");
+    auto prepared = frontend.prepare(input);
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.memory_query.has_value(), "memory query provenance missing");
+    if (data.memory_query) {
+        std::string decoded;
+        const auto span = *data.memory_query;
+        for (auto i = span.begin; i < span.begin + span.count; ++i) {
+            decoded += frontend.token_bytes(data.token_ids.at(i));
+        }
+        failures += check(decoded == query, "memory query included role/history/tool tokens");
+    }
+    auto raw = frontend.prepare_tokens(frontend.tokenize_text("raw query"), false);
+    const auto& raw_data = FrontendFactory::inspect(raw);
+    // The raw path marks the whole prompt as the query, and the retrieval-query policy clamps a
+    // span wider than kvmem_query_max_tokens to its tail; this prompt is far shorter than the
+    // 512-token default, so the span survives intact.
+    failures += check(raw_data.memory_query && raw_data.memory_query->begin == 0 &&
+                          raw_data.memory_query->count == raw_data.token_ids.size(),
+                      "raw token query range is not explicit");
+    return failures;
+}
+
+// A query wider than the cap is clamped to its tail: a mean key averaged over a whole document
+// retrieves nothing, which is what the 242k probe measured (`KVMEM_RETRIEVAL logical=45
+// query_tokens=185772 cold=0 selected=0`).
+int test_memory_query_clamp() {
+    const auto frontend = make_frontend(resources(), false);
+    std::string long_text;
+    for (int i = 0; i < 400; ++i) { long_text += "filler sentence number " + std::to_string(i) + " "; }
+    auto raw       = frontend.prepare_tokens(frontend.tokenize_text(long_text), false);
+    const auto& d  = FrontendFactory::inspect(raw);
+    const auto all = d.token_ids.size();
+    int failures   = check(all > 512, "fixture prompt is not longer than the query cap");
+    failures += check(d.memory_query.has_value(), "long raw prompt lost its query span");
+    if (d.memory_query) {
+        failures += check(d.memory_query->count == 512, "wide query was not clamped to the cap");
+        failures += check(d.memory_query->begin + d.memory_query->count == all,
+                          "clamped query is not the span tail");
+    }
+    // Cap 0 disables the policy, leaving the raw whole-prompt span.
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled         = false;
+    options.max_context            = 8192;
+    options.kvmem_query_max_tokens = 0;
+    const Frontend unclamped       = make_frontend(resources(), options);
+    auto raw2                      = unclamped.prepare_tokens(unclamped.tokenize_text(long_text), false);
+    const auto& d2                 = FrontendFactory::inspect(raw2);
+    failures += check(d2.memory_query && d2.memory_query->begin == 0 &&
+                          d2.memory_query->count == d2.token_ids.size(),
+                      "cap 0 did not disable the clamp");
+    return failures;
 }
 
 int test_ngram_proposal_only_sources() {
@@ -3250,11 +3345,22 @@ int test_forced_tool_call(const Frontend& frontend) {
     return failures;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    try {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
+    if (argc == 2 && std::string_view(argv[1]) == "--thinking-control-only") {
+        failures += test_thinking_budget_control(frontend);
+        failures += test_thinking_budget_ignores_quoted_close(frontend);
+        failures += test_structured_thinking_control(frontend);
+        failures += test_thinking_budget_message();
+        failures += test_thinking_budget_branches(frontend);
+        return failures == 0 ? 0 : 1;
+    }
     failures += test_declared_frontend_semantics();
+    failures += test_memory_query_provenance();
+    failures += test_memory_query_clamp();
     failures += test_ngram_proposal_only_sources();
     failures += test_tokenizer_config_merge();
     failures += test_bpe_merge_order();
@@ -3313,4 +3419,8 @@ int main() {
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "frontend test exception: " << error.what() << "\n";
+        return 1;
+    }
 }

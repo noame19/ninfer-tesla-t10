@@ -36,7 +36,9 @@ struct ToolCallOutputContract {
         DeclaredTypes,
     };
 
+    enum class Encoding : std::uint8_t { NonStrict, RawString, Json };
     struct Parameter {
+        Encoding encoding = Encoding::NonStrict;
         std::string name;
         NormalizationPolicy policy = NormalizationPolicy::Legacy;
         TypeSet types;
@@ -46,16 +48,28 @@ struct ToolCallOutputContract {
         std::string name;
         std::vector<Parameter> parameters;
         bool unambiguous = true;
+        bool strict = false;
+        std::string schema_json;
+        std::size_t declaration_index = 0;
     };
 
     std::vector<Tool> tools;
+    bool constrained = false;
+    bool required = false;
+    bool parallel = true;
     bool enforce_declared_names = false;
+    bool duplicate_names = false;
     // Function whose call opener the rendered prompt already carries, empty when the model chooses
     // freely. It lives here because the prompt that carries the opener is the only thing that knows
     // it: a second, independently supplied copy could name a different tool and the continuation
     // would be attributed to that one.
     std::string forced_tool_name;
+    std::string continuation;
 };
+
+[[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
+select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,
+                          const ToolChoice& choice);
 
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;

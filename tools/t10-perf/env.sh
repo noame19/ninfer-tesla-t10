@@ -22,6 +22,15 @@ PPL_TEXT="${NINFER_T10_PPL_TEXT:-$T10_PERF_DIR/ppl_probe.txt}"
 # The prefill driver: posts a 14-token-per-rep sentence, so reps=800 is ~11.2k and 3400 is ~47.6k.
 AB_DRIVER="${NINFER_T10_AB_DRIVER:-$T10_PERF_DIR/ab2.py}"
 
+# The KVMem branch build (task P1). The long-context recall probe runs against this one, not
+# against the port's main-line binary, because KVMem only exists on that branch.
+KVMEM_BIN="${NINFER_T10_KVMEM_BIN:-$HOME/work-rom/ninfer-run/stage3/ninfer-serve}"
+KVMEM_PORT="${NINFER_T10_KVMEM_PORT:-18083}"
+
+# The long-context probe corpus. Both are outside the repository and both are local files.
+RECALL_FILLER="${NINFER_T10_RECALL_FILLER:-$HOME/work-rom/ninfer-run/filler.txt}"
+RECALL_NOVEL="${NINFER_T10_RECALL_NOVEL:-$HOME/work-rom/ninfer-run/novel.txt}"
+
 PORT="${NINFER_T10_PORT:-18099}"
 
 # Logs and profile captures land here and nowhere else. Transient by construction.

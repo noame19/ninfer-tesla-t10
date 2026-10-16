@@ -13,6 +13,7 @@
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 #include "text/structured_output.h"
+#include "models/qwen3_5/frontend/tool_grammar.h"
 #include <mutex>
 
 #include <nlohmann/json.hpp>
@@ -252,6 +253,45 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
                        "prepared prompt exceeds Engine max_context " + std::to_string(max_context));
 }
 
+// Applies the KVMem retrieval-query policy to one prepared prompt.
+//
+// A raw /completion prompt has no structured "last user turn", so prepare_tokens marks the whole
+// prompt as the query. Averaged over a long document that mean-key vector carries no signal, and
+// retrieval then selects nothing beyond the mandatory sink/recent pages -- which is what the 242k
+// probe measured (`KVMEM_RETRIEVAL logical=45 query_tokens=185772 cold=0 selected=0`). Upstream
+// bounds the span instead: llama's --kvmem-query-max-tokens keeps `cap` tokens from the span tail,
+// and --kvmem-query-last falls back to `fallback` tokens when no role block exists. Applied to
+// every span, structured or not, so the two endpoints agree.
+//
+// The two limits are not interchangeable, and this is the measured part. Upstream's cap bounds a
+// *structured* span (the last user turn) so a long turn cannot swamp the mean key; its
+// --kvmem-query-last is what a spanless raw prompt gets. Applying the structured cap to a raw
+// whole-prompt span leaves 512 tokens of trailing prose, and the question that actually has to
+// match is ~80 tokens, so the mean key stays diluted. Measured on the small rig with the probes
+// evicted: cap 48/64/96 -> 3/3, cap 128 -> 2/3, cap 256 -> 2/3, cap 512 -> 1/3, cap 0 (raw whole
+// prompt, the pre-fix behaviour) -> 0/3.
+void apply_kvmem_query_policy(PreparedPromptData& prompt, std::uint32_t cap,
+                             std::uint32_t fallback) {
+    if (cap == 0) { return; } // policy disabled
+    auto& span       = prompt.memory_query;
+    const auto total = prompt.token_ids.size();
+    // A span covering the whole prompt is the raw-token fallback, not a role block: it says nothing
+    // about where the question is, so give it upstream's query-last window rather than the cap.
+    const bool whole_prompt = span && span->begin == 0 && span->count == total;
+    const auto limit        = whole_prompt ? std::min(fallback, cap) : cap;
+    // An absent or empty span carries no query at all; take the same fallback window.
+    if (!span || span->count == 0) {
+        const auto last = std::min<std::size_t>(limit, total);
+        if (last == 0) { return; }
+        span = TokenSpan{total - last, last};
+        return;
+    }
+    if (span->count <= limit) { return; }
+    // Clamp from the front: the tail of the span is what the model is about to answer.
+    const auto dropped = span->count - limit;
+    span = TokenSpan{span->begin + dropped, static_cast<std::size_t>(limit)};
+}
+
 std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages) {
     std::vector<fi::ChatMessage> result;
     result.reserve(messages.size());
@@ -390,6 +430,10 @@ void prepend_graft(const PromptGraft& graft, PreparedPromptData& prompt,
     for (VisionItem& item : prompt.vision_items) {
         for (TokenSpan& span : item.token_spans) { span.begin += shift; }
     }
+    // The retrieval query is a view into the same token vector, so a token inserted in front of
+    // the prompt moves it too. Without this the span would address the wrong tokens -- for a
+    // whole-prompt query it would silently stop covering the prompt's last tokens.
+    if (prompt.memory_query) { prompt.memory_query->begin += shift; }
     if (prompt.identity.rewrite_checkpoint) {
         prompt.identity.rewrite_checkpoint->frontier =
             shifted(prompt.identity.rewrite_checkpoint->frontier);
@@ -442,6 +486,9 @@ void apply_direct_graft(const PromptGraft& graft, PreparedPromptData& prompt,
     for (VisionItem& item : prompt.vision_items) {
         for (TokenSpan& span : item.token_spans) { span.begin += n_slots; }
     }
+    // Same shift as in prepend_graft: the retrieval query views the token vector this call just
+    // prefixed, so leaving it unshifted would move the query off its own tokens.
+    if (prompt.memory_query) { prompt.memory_query->begin += n_slots; }
     if (prompt.identity.rewrite_checkpoint) {
         prompt.identity.rewrite_checkpoint->frontier =
             shifted(prompt.identity.rewrite_checkpoint->frontier);
@@ -811,6 +858,8 @@ public:
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
+          kvmem_query_max_tokens(options.kvmem_query_max_tokens),
+          kvmem_query_last_fallback_tokens(options.kvmem_query_last_fallback_tokens),
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
           grafts(std::move(options.grafts)) {
@@ -925,6 +974,8 @@ public:
     std::vector<TokenId> ngram_boundaries;
     bool vision_enabled                          = true;
     std::uint32_t max_context                    = 0;
+    std::uint32_t kvmem_query_max_tokens         = 0;
+    std::uint32_t kvmem_query_last_fallback_tokens = 0;
     // Startup-fixed, published once through Frontend::publish_long_anchor_limit while the Engine
     // is still single-threaded; atomic so the request threads that read it see the published value
     // without a data race on a const shared implementation.
@@ -1092,6 +1143,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    if (!options.forced_tool_name.empty()) {
+        result.assistant_continuation = "<tool_call>\n<function=" + options.forced_tool_name + ">\n";
+    } else if (options.continuation == PromptContinuationMode::ContinueFinalAssistant && !messages.empty()) {
+        for (const auto& part : messages.back().parts)
+            if (part.kind == fi::ChatPartKind::Text) result.assistant_continuation += part.text;
+    }
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
@@ -1126,6 +1183,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.starts_in_reasoning = processed.starts_in_reasoning;
+        if (processed.memory_query) {
+            result.memory_query = TokenSpan{processed.memory_query->begin, processed.memory_query->count};
+        }
         result.token_types         = std::move(processed.token_types);
         result.positions           = std::move(processed.positions);
         result.rope_delta          = processed.rope_delta;
@@ -1168,6 +1228,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             throw_context_length_exceeded(impl_->max_context);
         }
         result.token_ids                   = std::move(encoded.input_ids);
+        if (encoded.memory_query) {
+            result.memory_query = TokenSpan{encoded.memory_query->begin, encoded.memory_query->count};
+        }
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
@@ -1189,6 +1252,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // request builds on, so it publishes no prefix of its own; a prefill graft is replayed, and its
     // end is published as a shared prefix.
     const bool is_direct_graft = graft && graft->kind != GraftKind::PrefillKV;
+    if (options.continuation == PromptContinuationMode::NewAssistantTurn && !message_boundaries.empty())
+        result.memory_input_end = message_boundaries.back().value_or(0);
     if (impl_->ngram_archive_enabled) {
         const std::span<const TokenId> tokens(result.token_ids);
         auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {
@@ -1258,6 +1323,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         build_ngram_index(result);
     }
     detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
+    // Applied last, after any graft has shifted the token indices, so the span describes the final
+    // prompt. Both endpoints get the same policy: a structured last-user span is clamped to its
+    // tail just like a raw whole-prompt span.
+    apply_kvmem_query_policy(result, impl_->kvmem_query_max_tokens,
+                             impl_->kvmem_query_last_fallback_tokens);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1329,6 +1399,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
+    result.memory_query = TokenSpan{0, result.token_ids.size()};
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         build_ngram_index(result);
@@ -1353,6 +1424,10 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
         result.tap_hints.hints.push_back(runtime::prefix_cache::TapHint{
             .position = frontier, .kind = runtime::prefix_cache::TapHintKind::GenerationOpener});
     }
+    // A raw prompt has no structured role span, so the whole prompt was marked as the query above;
+    // clamp it to the tail the model is about to answer from.
+    apply_kvmem_query_policy(result, impl_->kvmem_query_max_tokens,
+                             impl_->kvmem_query_last_fallback_tokens);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1374,21 +1449,31 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
                                             const ThinkingControlOptions& thinking,
-                                            const StructuredOutputOptions& structured) const {
+                                            const StructuredOutputOptions& structured,
+                                            const ToolChoice& tool_choice) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     std::shared_ptr<text::GrammarState> grammar;
     text::validate_structured_output(structured);
-    if (structured.kind != StructuredOutputKind::None) {
+    auto contract = fi::select_tool_call_contract(prompt.data_->tool_call_output, tool_choice);
+    const bool tools_constrained = contract && contract->constrained;
+    if (tools_constrained && !prompt.data_->assistant_continuation.empty()) {
+        auto continuation_contract = std::make_shared<fi::ToolCallOutputContract>(*contract);
+        continuation_contract->continuation = prompt.data_->assistant_continuation;
+        contract = std::move(continuation_contract);
+    }
+    if (tools_constrained || structured.kind != StructuredOutputKind::None) {
         if (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() ||
             !caller_stop.include_model_defaults || output.raw || output.preserve_special_tokens ||
             caller_stop.publish_stop_token) {
-            throw std::invalid_argument(
-                "structured output requires default stops and decoded text output");
+            if (tools_constrained)
+                throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                    "tool constraints require default EOS stops and decoded text output");
+            throw std::invalid_argument("structured output requires default stops and decoded text output");
         }
         text::StructuredOutputEnvelope envelope;
         if (prompt.data_->starts_in_reasoning) { envelope.reasoning_close = "</think>"; }
-        if (prompt.data_->tool_call_output) {
+        if (!tools_constrained && prompt.data_->tool_call_output) {
             envelope.alternative_format =
                 fi::structured_tool_call_format(*prompt.data_->tool_call_output);
         }
@@ -1398,19 +1483,25 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
             for (std::size_t id = 0; id < vocab.size(); ++id) {
                 if (impl_->tokenizer->is_valid_token(id) &&
                     (!impl_->tokenizer->is_special_token(id) ||
-                     impl_->tokenizer->decode_token_bytes(id, false) == "</think>")) {
+                     impl_->tokenizer->decode_token_bytes(id, false) == "</think>" ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "<tool_call>" ||
+                     impl_->tokenizer->decode_token_bytes(id, false) == "</tool_call>")) {
                     vocab[id] = impl_->tokenizer->decode_token_bytes(id, false);
                 }
             }
             impl_->grammar_compiler = std::make_unique<text::StructuredCompiler>(
                 std::move(vocab), impl_->tokenizer->default_stop_token_ids());
         }
-        grammar = impl_->grammar_compiler->compile(structured, envelope);
+        grammar = tools_constrained
+            ? impl_->grammar_compiler->compile_model(fi::tool_grammar(*contract, structured),
+                                                     structured, envelope.reasoning_close,
+                                                     prompt.data_->assistant_continuation)
+            : impl_->grammar_compiler->compile(structured, envelope);
     }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output, std::move(grammar));
+        impl_->thinking_control_tokens, std::move(contract), std::move(grammar));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
