@@ -253,6 +253,45 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
                        "prepared prompt exceeds Engine max_context " + std::to_string(max_context));
 }
 
+// Applies the KVMem retrieval-query policy to one prepared prompt.
+//
+// A raw /completion prompt has no structured "last user turn", so prepare_tokens marks the whole
+// prompt as the query. Averaged over a long document that mean-key vector carries no signal, and
+// retrieval then selects nothing beyond the mandatory sink/recent pages -- which is what the 242k
+// probe measured (`KVMEM_RETRIEVAL logical=45 query_tokens=185772 cold=0 selected=0`). Upstream
+// bounds the span instead: llama's --kvmem-query-max-tokens keeps `cap` tokens from the span tail,
+// and --kvmem-query-last falls back to `fallback` tokens when no role block exists. Applied to
+// every span, structured or not, so the two endpoints agree.
+//
+// The two limits are not interchangeable, and this is the measured part. Upstream's cap bounds a
+// *structured* span (the last user turn) so a long turn cannot swamp the mean key; its
+// --kvmem-query-last is what a spanless raw prompt gets. Applying the structured cap to a raw
+// whole-prompt span leaves 512 tokens of trailing prose, and the question that actually has to
+// match is ~80 tokens, so the mean key stays diluted. Measured on the small rig with the probes
+// evicted: cap 48/64/96 -> 3/3, cap 128 -> 2/3, cap 256 -> 2/3, cap 512 -> 1/3, cap 0 (raw whole
+// prompt, the pre-fix behaviour) -> 0/3.
+void apply_kvmem_query_policy(PreparedPromptData& prompt, std::uint32_t cap,
+                             std::uint32_t fallback) {
+    if (cap == 0) { return; } // policy disabled
+    auto& span       = prompt.memory_query;
+    const auto total = prompt.token_ids.size();
+    // A span covering the whole prompt is the raw-token fallback, not a role block: it says nothing
+    // about where the question is, so give it upstream's query-last window rather than the cap.
+    const bool whole_prompt = span && span->begin == 0 && span->count == total;
+    const auto limit        = whole_prompt ? std::min(fallback, cap) : cap;
+    // An absent or empty span carries no query at all; take the same fallback window.
+    if (!span || span->count == 0) {
+        const auto last = std::min<std::size_t>(limit, total);
+        if (last == 0) { return; }
+        span = TokenSpan{total - last, last};
+        return;
+    }
+    if (span->count <= limit) { return; }
+    // Clamp from the front: the tail of the span is what the model is about to answer.
+    const auto dropped = span->count - limit;
+    span = TokenSpan{span->begin + dropped, static_cast<std::size_t>(limit)};
+}
+
 std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages) {
     std::vector<fi::ChatMessage> result;
     result.reserve(messages.size());
@@ -391,6 +430,10 @@ void prepend_graft(const PromptGraft& graft, PreparedPromptData& prompt,
     for (VisionItem& item : prompt.vision_items) {
         for (TokenSpan& span : item.token_spans) { span.begin += shift; }
     }
+    // The retrieval query is a view into the same token vector, so a token inserted in front of
+    // the prompt moves it too. Without this the span would address the wrong tokens -- for a
+    // whole-prompt query it would silently stop covering the prompt's last tokens.
+    if (prompt.memory_query) { prompt.memory_query->begin += shift; }
     if (prompt.identity.rewrite_checkpoint) {
         prompt.identity.rewrite_checkpoint->frontier =
             shifted(prompt.identity.rewrite_checkpoint->frontier);
@@ -443,6 +486,9 @@ void apply_direct_graft(const PromptGraft& graft, PreparedPromptData& prompt,
     for (VisionItem& item : prompt.vision_items) {
         for (TokenSpan& span : item.token_spans) { span.begin += n_slots; }
     }
+    // Same shift as in prepend_graft: the retrieval query views the token vector this call just
+    // prefixed, so leaving it unshifted would move the query off its own tokens.
+    if (prompt.memory_query) { prompt.memory_query->begin += n_slots; }
     if (prompt.identity.rewrite_checkpoint) {
         prompt.identity.rewrite_checkpoint->frontier =
             shifted(prompt.identity.rewrite_checkpoint->frontier);
@@ -812,6 +858,8 @@ public:
           tokenizer(resources.tokenizer),
           processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
           vision_enabled(options.vision_enabled), max_context(options.max_context),
+          kvmem_query_max_tokens(options.kvmem_query_max_tokens),
+          kvmem_query_last_fallback_tokens(options.kvmem_query_last_fallback_tokens),
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
           grafts(std::move(options.grafts)) {
@@ -926,6 +974,8 @@ public:
     std::vector<TokenId> ngram_boundaries;
     bool vision_enabled                          = true;
     std::uint32_t max_context                    = 0;
+    std::uint32_t kvmem_query_max_tokens         = 0;
+    std::uint32_t kvmem_query_last_fallback_tokens = 0;
     // Startup-fixed, published once through Frontend::publish_long_anchor_limit while the Engine
     // is still single-threaded; atomic so the request threads that read it see the published value
     // without a data race on a const shared implementation.
@@ -1273,6 +1323,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         build_ngram_index(result);
     }
     detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
+    // Applied last, after any graft has shifted the token indices, so the span describes the final
+    // prompt. Both endpoints get the same policy: a structured last-user span is clamped to its
+    // tail just like a raw whole-prompt span.
+    apply_kvmem_query_policy(result, impl_->kvmem_query_max_tokens,
+                             impl_->kvmem_query_last_fallback_tokens);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1369,6 +1424,10 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
         result.tap_hints.hints.push_back(runtime::prefix_cache::TapHint{
             .position = frontier, .kind = runtime::prefix_cache::TapHintKind::GenerationOpener});
     }
+    // A raw prompt has no structured role span, so the whole prompt was marked as the query above;
+    // clamp it to the tail the model is about to answer from.
+    apply_kvmem_query_policy(result, impl_->kvmem_query_max_tokens,
+                             impl_->kvmem_query_last_fallback_tokens);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

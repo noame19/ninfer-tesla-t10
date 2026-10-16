@@ -115,6 +115,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                SSD: process-local active/idle tiering; fast prefill supports\n"
            "                                INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 text/images\n"
            "  --kvmem-verify-transfers      check restored KV/GDN bytes (diagnostic)\n"
+           "  --kvmem-query-max-tokens N    clamp a retrieval query to its last N tokens\n"
+           "                                (default 512; 0 disables the clamp)\n"
+           "  --kvmem-query-last N          query length used when no span is present\n"
+           "                                (default 64)\n"
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
@@ -709,6 +713,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--kvmem-sessions") {
             options.kvmem.retained_sessions = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--kvmem-sessions"), "kvmem-sessions"));
+            continue;
+        }
+        if (arg == "--kvmem-query-max-tokens") {
+            options.kvmem.query_max_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-query-max-tokens"),
+                                      "kvmem-query-max-tokens"));
+            continue;
+        }
+        if (arg == "--kvmem-query-last") {
+            options.kvmem.query_last_fallback_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-query-last"), "kvmem-query-last"));
             continue;
         }
         if (arg == "--kvmem-disk-path") {

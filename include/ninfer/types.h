@@ -579,6 +579,12 @@ struct KvmemOptions {
     // bounds reserved disk extents. No restart persistence or DirectStorage.
     std::filesystem::path disk_path;
     std::uint64_t disk_bytes = 0;
+    // Retrieval-query span policy, mirroring upstream's --kvmem-query-max-tokens and
+    // --kvmem-query-last. A query wider than query_max_tokens is clamped to its tail, because a
+    // mean key averaged over a whole document retrieves nothing; when the span is absent the last
+    // query_last_fallback_tokens are used instead. Zero disables the clamp.
+    std::uint32_t query_max_tokens = 512;
+    std::uint32_t query_last_fallback_tokens = 64;
     [[nodiscard]] std::uint64_t device_tokens() const noexcept {
         return static_cast<std::uint64_t>(selected_tokens) + reserve_tokens;
     }

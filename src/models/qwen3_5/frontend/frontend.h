@@ -31,6 +31,15 @@ struct FrontendOptions {
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing instead of being rejected. Zero leaves the artifact's pixel ceilings.
     std::uint32_t vision_max_merged_tokens = 16384;
+    // KVMem retrieval-query policy. A raw /completion prompt has no structured "last user turn",
+    // so prepare_tokens marks the whole prompt as the query; averaged over a long document that
+    // vector carries no signal, and retrieval then selects nothing useful. Upstream bounds the
+    // span instead: --kvmem-query-max-tokens caps the tail of a *structured* span, while
+    // --kvmem-query-last is the window a spanless raw prompt gets. The two are separate because a
+    // raw prompt's whole-prompt span must fall back to the short window, not to the structured cap
+    // (measured: 64-token window scores 3/3 where the 512-token cap scores 1/3). Zero disables.
+    std::uint32_t kvmem_query_max_tokens = 512;
+    std::uint32_t kvmem_query_last_fallback_tokens = 64;
     // End-of-thinking message injected when a request hits its thinking budget. Empty
     // preserves the built-in canonical control suffix; a message lacking the canonical
     // </think> close serialization gets it appended at startup.
