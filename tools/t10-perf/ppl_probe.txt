@@ -1,0 +1,475 @@
+# NInfer-all
+
+A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
+their fine-tunes and Ternary Bonsai 2) and Qwen3.8-Flash-Next, on the RTX 3090, RTX 4090, RTX 5090
+and RTX PRO 6000 Blackwell. It serves the OpenAI, Anthropic and llama.cpp APIs from one GPU, or from
+up to eight as pipeline stages on Linux.
+
+NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
+carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
+The [documentation map](docs/README.md) lists the guides and references.
+
+## Tesla T10 (Turing sm_75) port
+
+This fork adds an `sm_75` target so the engine runs on an **NVIDIA Tesla T10** (TU102, 16 GB,
+compute capability 7.5), keeping the GGUF block-format support this line carries so a mixed
+`gguf_q4_k` / `gguf_iq3_s` / `gguf_iq4_xs` / … artifact loads unchanged.
+
+Turing is the oldest device the Ampere/Ada compatibility path serves, and it is missing two things
+that path assumed:
+
+* **No `cp.async`** (added in Ampere). `src/ops/common/memory.cuh` falls back to synchronous
+  register-staged copies with `cp_commit`/`cp_wait` as no-ops; every staging loop already ends in a
+  `__syncthreads()`, which is what publishes the data.
+* **No `m16n8k16`/`m16n8k32` tensor-core shapes.** Turing's f16 and int8 MMA shapes are `m16n8k8`
+  and `m8n8k16`. `src/ops/common/mma.cuh` emulates `m16n8k16` (f16 and f16-accumulate) as two
+  `m16n8k8`, `m16n8k32` (s8) as four `m8n8k16`, and tf32 `m16n8k8` by gathering its more widely
+  distributed operands onto the f16 unit. `ldmatrix` exists on Turing, so fragment assembly is
+  unchanged.
+
+`CMakeLists.txt` admits `75`, runs the `NINFER_SM8X_COMPAT` path for it and defines `NINFER_SM75`.
+FP8 A8 and NVFP4 W4A4 stay stubbed as they are for `sm_86`. CUDA 13 still supports `sm_75`, so the
+build uses the same toolkit as the other targets.
+
+Build (the artifacts are produced by `.github/workflows/build-sm75.yml` on GPU-less runners):
+
+```bash
+cmake -S . -B build-sm75 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=75 -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF
+cmake --build build-sm75 -j
+```
+
+An `sm_75` build runs only on Turing (Tesla T10, RTX 2080 Ti, …); the Ampere/Ada builds do not run
+on it, and it does not run on `sm_86`.
+
+## Highlights
+
+### Ternary Bonsai 2 27B and Qwen3.8-27B
+
+Measured in September 2026, one card each, greedy, one request unless the row says otherwise.
+Setups and full tables: [reference measurements](docs/performance/reference-2026-09.md).
+
+| | RTX 3090 | RTX 4090 | RTX 5090 | RTX PRO 6000 |
+|---|---:|---:|---:|---:|
+| **Ternary Bonsai 2 27B**, short chat (DFlash2, 7 drafts) | 202 tok/s | 256 tok/s | 397 tok/s | 381 tok/s |
+| decode after a 261K-token document (fastest drafter) | 90 tok/s | 123 tok/s | 218 tok/s | 218 tok/s |
+| time to first token for a 261K-token prompt | 215 s | 102 s | 82 s | 78 s |
+| largest context, filled and all three needles found | 970,752 | 958,464 | 978,944 | 1,048,576\* |
+| eight requests at once (MTP, 3 drafts), total | 551 tok/s | 824 tok/s | 1,063 tok/s | 1,155 tok/s |
+| **Qwen3.8-27B**, short chat (DFlash2, 7 drafts) | 118 tok/s | 149 tok/s | 236 tok/s | 237 tok/s |
+| largest context, filled and all three needles found | 417,792 | 405,504 | 872,448 | 1,048,576\* |
+| eight requests at once (MTP, 3 drafts), total | 329 tok/s | 442 tok/s | 690 tok/s | 739 tok/s |
+
+\* The engine's ceiling. The RTX PRO 6000 (96 GB) starts there with every KV format and drafter;
+filled to it, both models find two of the three needles.
+
+- **RTX PRO 6000 against RTX 5090.** Re-measured in October beside an RTX 5090, both at 600 W, the
+  PRO 6000 came back within 2% of September wherever the drafts accepted the same share. One
+  request's decode is bound by memory bandwidth, and both cards have 1.79 TB/s of GDDR7 (Bonsai 2
+  without speculation: 167.7 against 170.4 tok/s). The PRO 6000's 188 SMs against 170 show where
+  compute decides: the 261K prompt is 2% faster and eight requests at once 6 to 7% faster
+  ([re-check](docs/performance/reference-2026-09.md#re-check-october-2026)).
+- **Draft length.** DFlash2 with seven drafts is fastest on short answers; after long documents the
+  best count is three to seven. MTP runs up to fifteen drafts and is fastest at three to five.
+- **Past the native window.** Filled to about 880K tokens, Bonsai 2 returned all three planted codes
+  on every card. At 1,048,576 tokens (RTX 5090 and PRO 6000 only) it misses the one at 943K.
+
+### Qwen3.8-Flash-Next
+
+One request, greedy, October 2026. Each cell is **decode of a short answer · prefill of a
+4,463-token prompt**, in tok/s. Decode after the long prompt, memory, host links and power limits:
+[Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md#measurements).
+
+**Q2_0** (35.9 GiB model + 26.8 GiB n-gram table):
+
+| Experts | RTX PRO 6000 | RTX 5090 | RTX 4090 | RTX 3090 |
+|---|---:|---:|---:|---:|
+| on the GPU (two cards, except the PRO 6000) | 138 · 2,939 | 136 · 3,809 | 97 · 3,608 | 90 · 1,504 † |
+| in pinned host memory | 55 · 1,297 | 74 · 1,677 | 53 · 1,138 | 49 · 842 |
+| on disk, the files in the page cache | 76 · 2,024 | 68 · 1,739 | 42 · 723 | 47 · 630 |
+| on disk, cold (pages evicted every second) | 35 · 1,000 | 25 · 694 | 18 · 160 | 17 · 195 |
+
+† Two RTX 3090 Ti.
+
+The host and disk rows were measured before the October 9 decode work. Host experts on an RTX 3090
+now decode 87-94 tok/s in a different workload, 98-100 with a repeated prompt
+([host experts on one RTX 3090](docs/qwen3-8-flash-next.md#host-experts-on-one-rtx-3090)).
+
+**IQ3_S** (51.9 GiB model + the same table):
+
+| Experts | RTX PRO 6000 | RTX 5090 | RTX 3090 |
+|---|---:|---:|---:|
+| on the GPU (two cards for the RTX 5090) | 125 · 2,541 | 122 · 3,326 | — |
+| in pinned host memory | 29 · 803 | 41 · 1,100 | 34 · 533 |
+| on disk, the files in the page cache | 66 · 1,661 | 55 · 439 | 19 · 209 ‡ |
+| on disk, cold | 29 · 773 | 19 · 171 | 11 · 47 |
+
+— Not measured: every expert needs three 24 GB cards. ‡ The host's 62 GB of RAM cached only part
+of the file.
+
+**Coder IQ1_M** (28.4 GiB model + the same table), one NVIDIA L40S (48 GB):
+
+| Experts | NVIDIA L40S |
+|---|---:|
+| in pinned host memory | 35 · 1,648 |
+| on disk, the files in the page cache | 42 · 1,938 |
+
+- **The host matters.** Host and disk rows depend on the host as much as on the card. The RTX 5090
+  host had PCIe 5.0 x16; the others had PCIe 4.0 x16.
+- **The PRO 6000 caches almost everything.** Its 96 GB device expert cache ends up holding nearly
+  every expert.
+- **RTX 4090 host pinning.** The RTX 4090 rows ran pinned to the GPUs' NUMA node in a two-socket VM.
+  Unpinned, host experts decode there at 40 tok/s and disk experts at 32 to 33.
+- **Many requests at once.** Six reasoning requests at once on two RTX 5090s produced 193 tok/s of
+  output with Q2_0.
+
+## Features
+
+**Models and weight formats**
+
+- **Qwen3.5 family.** Dense and MoE (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) with MTP,
+  DFlash (35B-A3B) and DFlash2 (Qwen3.8-27B) drafters, Vision for images and video, and
+  `groupwise-int`, FP8, NVFP4 and ternary weights. NVFP4 expert banks prefill through W4A4 and need
+  a `120a` build.
+- **GGUF block formats.** Releases that pick a ggml type per tensor, such as ISTA-DASLab's GSQ-RCO,
+  convert without requantization and multiply their blocks in place. The 3.5-bit Qwen3.8-27B IQ3_S
+  release holds 10.95 GiB of weights instead of 15.9, scores WikiText-2 perplexity 7.071 (the
+  official artifact: 7.286) and decodes at 59.9 tok/s against the official artifact's 40.3 on an
+  RTX 3090 ([GGUF block formats](docs/gguf.md)).
+- **Ternary Bonsai 2 27B.** PrismML's [ternary Qwen3.8-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+  runs from `t2_g128_fp16` weights: 2.125 bits per weight, imported without rounding, with the
+  Hadamard rotations fused into the norms and gates and integer activations for its projections.
+  The `bonsai2_27b_ternary` recipe adds ProCreations' MTP head and DFlash2 adapter and an exact
+  proposal head.
+- **Qwen3.8-Flash-Next.** The 125B-parameter MoE (512 experts, about 6B active) from the GSQ-RCO
+  GGUF releases, with its experts on the GPUs, in pinned host memory with a GPU cache
+  (`--expert-residency host`) or in the artifact's files read into a GPU cache
+  (`--expert-residency disk`, under 1 GB of RAM). It serves up to eight requests with prefix reuse,
+  structured output, images and video, and MTP drafting. On two RTX 5090s the Q2_0 release scores
+  93.3% on AIME 2025 and 86.4% on GPQA-Diamond ([Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md)).
+
+**Speculative decoding**
+
+- MTP, DFlash and DFlash2 with 1 to 15 drafts; the artifact's proposal head drafts by default when it
+  stores one. Under MTP and DFlash a sampled request keeps a draft only while it equals the model's
+  own keyed draw, so every emitted token is the model's sample; DFlash2 verifies its proposal
+  distribution by rejection sampling.
+- `--adaptive-mtp` picks each round's width from measured draft survival and round cost.
+- N-gram copy drafting beside the neural drafter (on with `--spec`) verifies up to 15 tokens copied
+  from earlier prompt, tool-result or output text ([ngram copy proposals](docs/ngram.md)).
+
+**Context and memory**
+
+- Nine KV formats, from `bf16` to `rk2v4-e8` at 216 bytes per token and KV head; `rk8v4` is the
+  all-round choice and `rk4v4` holds the native 262,144-token window of Qwen3.8-27B on a 24 GB card
+  ([context and memory](docs/cli.md#context-and-memory)).
+- Up to 1,048,576 tokens of context, four times the native window, with plain RoPE or YaRN
+  (`--rope-yarn`).
+- A context cache of checkpoints on the device, in pinned host memory and in an optional disk tier
+  that survives restarts (`--disk-kv-path`, `--disk-kv-restore`), with endpoint and branch anchors
+  that let an edited or regenerated turn resume where it left the conversation. The hybrid prefix
+  cache (`--use-alt-prefix-caching`) shares content-addressed KV blocks across requests instead.
+- Precision trades that buy context: `--embedding-q4`, `--lm-head-q6`, `--gdn-state-fp16`
+  ([quality trades](docs/maintainer/quality-trade-experiments.md)).
+
+**Serving**
+
+- OpenAI Responses and Chat Completions, Anthropic Messages, llama.cpp's `/completion`,
+  `/tokenize`, `/detokenize`, `/apply-template`, `/v1/rerank`, `/metrics`, `/slots` and `/props`,
+  streaming, tool calls, structured output through xgrammar (`--structured-output`), token log
+  probabilities and prompt grafts ([HTTP serving](docs/serving.md)).
+- **Model suspend.** `--model-suspend` lets an idle server give its device memory back without
+  exiting and take it again on the next request, retained conversations included. Ternary Bonsai 2
+  27B on an RTX 3090: 7.9 GiB down to 0.3 GiB in 0.33 s, back in 1.1 s
+  ([model suspend](docs/serving.md#model-suspend)).
+- **Several models behind one server.** With `--models-dir` or a llama.cpp-style
+  `--models-preset`, `ninfer-serve` is a router with llama.cpp's model API; with `--model-suspend` a
+  model sleeps instead of unloading: two 27B models on one 24 GB RTX 3090 swap in 1.8 s instead of
+  an 11.6 s cold load ([several models](docs/serving.md#several-models-router)).
+- `GET /stats` and a [monitoring dashboard](tools/monitor/README.md), request logs with rotation,
+  and an optional compiled-in WebUI.
+
+**Kernels and devices**
+
+- **Device route profiles.** Each card's measured profile picks the kernel route for every
+  operation and width. Profiles are built in for the RTX 3090, 4090, 5090 and the three RTX PRO
+  6000 editions; any other GPU is measured once at first start, and `ninfer-calibrate` re-measures
+  ([device profiles](docs/device-profiles.md)).
+- **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
+  stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
+- FP8 A8 and NVFP4 W4A4 tensor-co
+
+hat makes the parity even.
+__device__ __forceinline__ std::uint32_t ksigns(std::uint32_t v) {
+    return v ^ ((__popc(v) & 1) << 7);
+}
+
+__device__ __forceinline__ int dot4(const int* w, const int* a, int acc) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { acc = ggml_cuda_dp4a(w[i], a[i], acc); }
+    return acc;
+}
+
+__device__ __forceinline__ int sum4(const int* a) {
+    int acc = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { acc = ggml_cuda_dp4a(a[i], 0x01010101, acc); }
+    return acc;
+}
+
+__device__ __forceinline__ int sum2(const int* a) {
+    return ggml_cuda_dp4a(a[1], 0x01010101, ggml_cuda_dp4a(a[0], 0x01010101, 0));
+}
+
+// The 6-bit scale and min of sub-block j of a Q4_K / Q5_K block (ggml's get_scale_min_k4).
+__device__ __forceinline__ void scale_min_k4(const std::uint8_t* s, int j, int& sc, int& m) {
+    if (j < 4) {
+        sc = s[j] & 63;
+        m  = s[j + 4] & 63;
+    } else {
+        sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
+        m  = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+    }
+}
+
+// dot() is the contribution of one slice to one column: d and sum are the column's slice scale and
+// the sum of its unquantized values.
+template <ggml_type type>
+struct Decoder;
+
+template <>
+struct Decoder<GGML_TYPE_Q8_0> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 34, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { s.w[i] = int(u32_a2(b + 2 + 4 * i)); }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+// Q4_0: codes c in 0..15, value d * (c - 8); value j < 16 is the low nibble of byte j, value
+// j + 16 its high nibble.
+template <>
+struct Decoder<GGML_TYPE_Q4_0> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 18, kTableWords = 0;
+
+    __device__ static const std::uint32_t* table() { return nullptr; }
+
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t q = u32_a2(b + 2 + 4 * j);
+            s.w[j]                = int(__vsubss4(q & 0x0F0F0F0Fu, 0x08080808u));
+            s.w[j + 4]            = int(__vsubss4((q >> 4) & 0x0F0F0F0Fu, 0x08080808u));
+        }
+    }
+
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+// Q5_0: Q4_0's nibbles with a fifth bit per value in qh (bit j for value j), value d * (c - 16).
+template <>
+struct Decoder<GGML_TYPE_Q5_0> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 22, kTableWords = 0;
+
+    __device__ static const std::uint32_t* table() { return nullptr; }
+
+    // The four bits of `h` as bit 4 of four bytes.
+    __device__ __forceinline__ static std::uint32_t high_bits(std::uint32_t h) {
+        return ((h << 4) & 0x00000010u) | ((h << 11) & 0x00001000u) | ((h << 18) & 0x00100000u) |
+               ((h << 25) & 0x10000000u);
+    }
+
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0]                 = half_at(b);
+        const std::uint32_t qh = u32_a2(b + 2);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t q  = u32_a2(b + 6 + 4 * j);
+            const std::uint32_t lo = (q & 0x0F0F0F0Fu) | high_bits(qh >> (4 * j));
+            const std::uint32_t hi = ((q >> 4) & 0x0F0F0F0Fu) | high_bits(qh >> (16 + 4 * j));
+            s.w[j]                 = int(__vsubss4(lo, 0x10101010u));
+            s.w[j + 4]             = int(__vsubss4(hi, 0x10101010u));
+        }
+    }
+
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+// Q2_0: 64 two-bit codes c, value d * (c - 1); value j is bits 2(j % 4) of byte j / 4. A block is
+// two 32-value slices.
+template <>
+struct Decoder<GGML_TYPE_Q2_0> {
+    static constexpr int kBlockElems = 64, kBlockBytes = 18, kTableWords = 0;
+
+    __device__ static const std::uint32_t* table() { return nullptr; }
+
+    // The four codes of byte `x` as four bytes, minus one each.
+    __device__ __forceinline__ static int spread(std::uint32_t x) {
+        x &= 0xFFu;
+        return int(__vsubss4((x | (x << 6) | (x << 12) | (x << 18)) & 0x03030303u, 0x01010101u));
+    }
+
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
+                                                  const std::uint32_t*, Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const std::uint32_t q = u32_a2(b + 2 + 8 * u + 4 * h);
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) { s.w[4 * h + byte] = spread(q >> (8 * byte)); }
+        }
+    }
+
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+
+    // The transposed form for activations stored by decode_quantize<true>: word 4h + k holds the
+    // raw codes of values 16h + k, 16h + 4 + k, 16h + 8 + k and 16h + 12 + k, two operations per
+    // word instead of a spread per byte, and the codes' offset of one comes off as the slice's sum
+    // of quantized activations. The integer dot is the same, so the product is dot()'s bit for bit.
+    static constexpr bool kTransposed = true;
+
+    // `b` is global memory (device or mapped host): read-only loads.
+    __device__ __forceinline__ static void decode_t(const std::uint8_t* b, int u, Slice& s) {
+        const auto* h16 = reinterpret_cast<const unsigned short*>(b);
+        s.f[0]          = __half2float(__ushort_as_half(__ldg(h16)));
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const std::uint32_t q = std::uint32_t(__ldg(h16 + 1 + 4 * u + 2 * h)) |
+                                    (std::uint32_t(__ldg(h16 + 2 + 4 * u + 2 * h)) << 16);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) { s.w[4 * h + k] = int((q >> (2 * k)) & 0x03030303u); }
+        }
+    }
+
+    __device__ __forceinline__ static float dot_t(const Slice& s, const int* a, float d, int qsum) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)) - qsum);
+    }
+};
+
+// Decoders with a transposed form (decode_t / dot_t over decode_quantize<true> activations).
+template <class D, class = void>
+struct transposed : std::false_type {};
+template <class D>
+struct transposed<D, std::void_t<decltype(D::kTransposed)>> : std::bool_constant<D::kTransposed> {};
+
+// A slice and its product in a decoder's transposed form when it has one; `sum` serves the plain
+// form and `qsum` the transposed one.
+template <class D>
+__device__ __forceinline__ void decode_slice(const std::uint8_t* b, int sub,
+                                             const std::uint32_t* table, Slice& s) {
+    if constexpr (transposed<D>::value) {
+        D::decode_t(b, sub, s);
+    } else {
+        D::decode(b, sub, table, s);
+    }
+}
+template <class D>
+__device__ __forceinline__ float dot_slice(const Slice& s, const int* a, float d, float sum,
+                                           int qsum) {
+    if constexpr (transposed<D>::value) {
+        return D::dot_t(s, a, d, qsum);
+    } else {
+        return D::dot(s, a, d, sum);
+    }
+}
+
+template <>
+struct Decoder<GGML_TYPE_IQ4_NL> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 18, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = get_int_from_table_16(int(u32_a2(b + 2 + 4 * j)), kvalues_iq4nl);
+            s.w[j]       = v.x;
+            s.w[j + 4]   = v.y;
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+template <>
+struct Decoder<GGML_TYPE_IQ4_XS> {
+    static constexpr int kBlockElems = 256, kBlockBytes = 136, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
+                                                  const std::uint32_t*, Slice& s) {
+        const std::uint32_t sh = *reinterpret_cast<const std::uint16_t*>(b + 2);
+        const int ls           = ((b[4 + u / 2] >> (4 * (u & 1))) & 0xF) | (((sh >> (2 * u)) & 3) << 4);
+        s.f[0]                 = half_at(b) * float(ls - 32);
+        const uint2 lo         = *reinterpret_cast<const uint2*>(b + 8 + 16 * u);
+        const uint2 hi         = *reinterpret_cast<const uint2*>(b + 16 + 16 * u);
+        const std::uint32_t q[4] = {lo.x, lo.y, hi.x, hi.y};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = get_int_from_table_16(int(q[j]), kvalues_iq4nl);
+            s.w[j]       = v.x;
+            s.w[j + 4]   = v.y;
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+template <>
+struct Decoder<GGML_TYPE_Q4_K> {
+    static constexpr int kBlockElems = 256, kBlockBytes = 144, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
+                                                  const std::uint32_t*, Slice& s) {
+        const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
+        int sc, m;
+        scale_min_k4(b + 4, u, sc, m);
+        s.f[0]              = dm.x * float(sc);
+        s.f[1]              = dm.y * float(m);
+        const uint4* qs     = reinterpret_cast<const uint4*>(b + 16 + 32 * (u / 2));
+        const uint4 a0      = qs[0];
+        const uint4 a1      = qs[1];
+        const int shift     = 4 * (u & 1);
+        const std::uint32_t v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { s.w[i] = int((v[i] >> shift) & 0x0F0F0F0Fu); }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) - s.f[1] * sum;
+    }
+};
+
+template <>
+struct Decoder<GGML_TYPE_Q5_K> {
+    static constexpr int kBlockElems = 256, kBlockBytes = 176, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
+                                                  const std::uint32_t*, Slice& s) {
+        const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
+        int sc, m;
+        scale_min_k4(b + 4, u, sc, m);
+        s.f[0]          = dm.x * float(sc);
+        s.f[1]          = dm.y * float(m);
+        const uint4* qh = reinterpret_cast<const uint4*>(b + 16);
+        const uint4* ql = reinterpret_cast<const uint4*>(b + 48 + 32 * (u / 2));
+        const uint4 h0 = qh[0], h1 = qh[1], l0 = ql[0], l1 = ql[1];
+        const std::uint32_t hv[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+        const std::uint32_t lv[8] = {l0.x, l0.y, l0.z, l0.w, l
+
+在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。在长上下文的推理里，显存带宽往往是最先碰到的墙。量化权重把每字节的信息压得更紧，但解码这些块本身也要花指令和访存。图灵架构没有 cp.async，所以软件流水线必须手工搭起来。
