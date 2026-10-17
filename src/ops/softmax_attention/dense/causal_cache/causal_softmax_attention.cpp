@@ -425,17 +425,32 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
     // chunked small-T route, which splits a wide prefill into 8-token chunks.
     //
     // The fast INT8 prompt kernel (prompt_i8_fast.cuh) does fit once its arena is single-buffered:
-    // 8 warps at 58,880 B with packed values, or 4 warps at 50,176 B. It is still not the default,
-    // because that fits fewer warps per SM than the chunked route it would replace -- 8 against 12
-    // -- and its per-CTA sweep is what bounds a prefill. NINFER_PROMPT_ROUTE=1 selects it anyway,
-    // which is how the two are compared; it must be paired with --fast-prefill-kernel, since the
-    // general prompt kernel's 93,184-byte arena does not fit either.
-    static const bool prompt_route_enabled = [] {
+    // 8 warps at 58,880 B with packed values, or 4 warps at 50,176 B. That is fewer warps per SM
+    // than the chunked route it replaces (8 against 12), which is why the route was left off until
+    // it was measured; it is faster anyway, because the chunked route pays 8-token chunks and an
+    // INT8 partial while the prompt kernel sweeps the whole chunk in one CTA with an FP16
+    // accumulator. Measured on the 27B artifact (2026-10-16), prompt against chunked:
+    //   11.2k prefill 514.7 vs 476.7 tok/s (+8.0%), 47.6k 455.7 vs 387.3 (+17.7%),
+    //   TTFT at 47.6k 1m44.5s vs 2m2.9s, PPL 3.00762 vs 3.01334.
+    //
+    // It is reachable only through the fast prompt kernel: the general INT8 prompt kernel's
+    // 93,184-byte arena does not fit Turing, so routing here without it would land on a kernel
+    // whose shared memory request raises cudaErrorInvalidValue. causal_attention_prompt_fast_kernel
+    // answers true for the whole INT8 family on this build, so the route is on by default;
+    // NINFER_PROMPT_FAST=0 turns the kernel off and NINFER_PROMPT_ROUTE=0/1 forces the route, which
+    // is how the two were compared.
+    static const int forced_prompt_route = [] {
         const char* value = std::getenv("NINFER_PROMPT_ROUTE");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
     }();
+    const bool fast_prompt_available =
+        causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel);
     const CausalAttentionRoute kPromptFallback =
-        prompt_route_enabled ? CausalAttentionRoute::Prompt : CausalAttentionRoute::ChunkedSmallT;
+        forced_prompt_route >= 0
+            ? (forced_prompt_route == 1 ? CausalAttentionRoute::Prompt
+                                        : CausalAttentionRoute::ChunkedSmallT)
+        : fast_prompt_available ? CausalAttentionRoute::Prompt
+                                : CausalAttentionRoute::ChunkedSmallT;
 #else
     constexpr CausalAttentionRoute kPromptFallback = CausalAttentionRoute::Prompt;
 #endif

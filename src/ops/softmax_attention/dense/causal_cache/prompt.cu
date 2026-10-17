@@ -245,7 +245,21 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
         return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
     }();
     if (forced >= 0) { return forced == 1; }
+#if defined(NINFER_SM75)
+    // On Turing the fast kernel is the only prompt kernel that fits, so it is the default rather
+    // than an opt-in. The general INT8 prompt kernel's own arena is 93,184 bytes against 64 KiB of
+    // shared memory per SM, so the alternative to the fast kernel is not another prompt kernel but
+    // the chunked small-T route, measured 8.0% slower at 11.2k and 17.7% slower at 47.6k.
+    //
+    // Defaulting it here rather than in the profile is deliberate: --device-profile off has to get
+    // it too, and with no fitting prompt kernel the route would otherwise be unreachable.
+    //
+    // Only the INT8 family: NVFP4-G16's prompt kernel is Blackwell-only (prompt_nvfp4_fast.cuh),
+    // so claiming one here would route NVFP4 onto the general prompt kernel that does not fit.
+    return kv_cache_is_int8_family(storage);
+#else
     return device_route_schedule("attn_prompt_fast", 1) == "on";
+#endif
 }
 
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
