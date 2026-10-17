@@ -96,13 +96,15 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             issue.template operator()<false, KvKeyCoding::Int8>();
         }
     };
+    // The width's query rows fill this many 16-row tiles; the legal warp counts and the fallback
+    // ladder below are both written in terms of it (see the note there).
+    constexpr int kRowTiles = (TokenTile * Geometry::GroupSize + 15) / 16;
     // A device profile names the tier per window: "<warps>x<CTAs per SM>x<key block>", with a
     // trailing "d" for the dynamic-arena variant, "q" for split QK and "e" for EarlyFetch.
     const std::string_view routed = device_route_schedule(
         small_t_i8_route_key(Geometry::QHeads, cache.storage, TokenTile), implementation_window);
     if (!routed.empty()) {
-        constexpr int kRowTiles = (TokenTile * Geometry::GroupSize + 15) / 16;
-        bool taken              = true;
+        bool taken = true;
         if constexpr (kRowTiles == 1) {
             if (routed == "2x4x32") {
                 launch.template operator()<2, 4, 32, false>();
@@ -189,63 +191,74 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             return;
         }
     }
+    // Legal warp counts for this geometry's row-tile count. PVNtPerWarp = 256 / (Wc / kRowTiles *
+    // 8) has to be one of 2/4/8/16, so Wc must be kRowTiles times one of 2/4/8/16: the 27B's
+    // three-row group takes 6/12/24, a two-row group takes 4/8/16/32. Twelve warps over two row
+    // tiles lands on PVNt = 5 and does not compile, which is why the fallback below is written in
+    // terms of kRowTiles instead of a fixed tier per window.
+    constexpr int kWarp2  = 2 * kRowTiles;
+    constexpr int kWarp4  = 4 * kRowTiles;
+    constexpr int kWarp8  = 8 * kRowTiles;
+    constexpr int kWarp16 = 16 * kRowTiles;
     if constexpr (TokenTile >= 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<24, 1, 32, false>();
+            launch.template operator()<kWarp8, 1, 32, false>();
         } else if (implementation_window <= 2054) {
-            launch.template operator()<12, 1, 32, false>();
+            launch.template operator()<kWarp4, 1, 32, false>();
         } else if (implementation_window <= 8198) {
 #if defined(NINFER_SM75)
             // The 64-key arena needs 65,536 bytes of dynamic shared memory -- all of Turing's
             // shared memory per SM -- so use the 32-key route (2*KeyBlock*HeadDim = 32 KiB).
-            launch.template operator()<12, 1, 32, false>();
+            launch.template operator()<kWarp4, 1, 32, false>();
 #else
-            launch.template operator()<12, 1, 64, true>();
+            launch.template operator()<kWarp4, 1, 64, true>();
 #endif
         } else {
-            // The longest windows: 12 warps and one CTA per SM, the tier every route table gives
-            // this window. A 6x2x32 launch cannot place a second CTA -- the arena is 4*32*256 =
-            // 32 KiB of dynamic shared memory on top of 16,448 B of static against Turing's
-            // 65,536 B per SM -- so MinBlocksPerSm=2 only spends registers on a residency that
-            // never happens, and six warps per SM run where twelve fit. Measured on the T10 this
-            // fallback is what a profile-less long-context prefill takes, and it is the same loss
-            // the w6/w7/w8 route entries carried before db404f24 moved them off 6x2x32qe.
-            launch.template operator()<12, 1, 32, true, 2, true>();
+            // The longest windows: one CTA per SM and the widest legal warp count for this row-tile
+            // count, which is the tier every route table gives this window. A 6x2x32 launch cannot
+            // place a second CTA -- the arena is 4*32*256 = 32 KiB of dynamic shared memory on top
+            // of 16,448 B of static against Turing's 65,536 B per SM -- so MinBlocksPerSm=2 only
+            // spends registers on a residency that never happens, and six warps per SM run where
+            // twelve (or eight, for a two-row group) fit. Measured on the T10 this fallback is what
+            // a profile-less long-context prefill takes, and it is the same loss the w6/w7/w8 route
+            // entries carried before db404f24 moved them off 6x2x32qe.
+            launch.template operator()<kWarp4, 1, 32, true, 2, true>();
         }
     } else if constexpr (TokenTile == 5) {
-        if constexpr (Geometry::GroupSize == 6) {
-            // Two Q row tiles for the 27B group of six.
+        if constexpr (kRowTiles == 2) {
+            // Two Q row tiles: the 27B's group of six at width 5, and every group of four at any
+            // width of five. Ladder 16R/8R/4R = 32/16/8 here.
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<32, 1, 32, false>();
+                launch.template operator()<kWarp16, 1, 32, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<16, 1, 32, false>();
+                launch.template operator()<kWarp8, 1, 32, false>();
             } else {
-                launch.template operator()<8, 2, 32, false>();
+                launch.template operator()<kWarp4, 2, 32, false>();
             }
         } else {
-            // Three Q row tiles for the 35B group of eight. The 24/12-warp
-            // routes retain eight/four consumer warps per tile; the 6-warp
-            // route is reserved for long windows where CTA residency wins.
+            // Three Q row tiles, the 35B group of eight at width five. The 24/12-warp routes
+            // retain eight/four consumer warps per tile; the 6-warp route is reserved for long
+            // windows where CTA residency wins.
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<24, 1, 32, false>();
+                launch.template operator()<kWarp8, 1, 32, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<24, 1, 32, false>();
+                launch.template operator()<kWarp8, 1, 32, false>();
             } else if (implementation_window <= 4096) {
-                launch.template operator()<12, 1, 32, false>();
+                launch.template operator()<kWarp4, 1, 32, false>();
             } else {
-                launch.template operator()<6, 2, 32, false>();
+                launch.template operator()<kWarp2, 2, 32, false>();
             }
         }
     } else if constexpr (TokenTile == 4) {
         if (implementation_window <= 1029) {
-            launch.template operator()<16, 1, 32, false>();
+            launch.template operator()<kWarp16, 1, 32, false>();
         } else {
-            launch.template operator()<8, 2, 32, false>();
+            launch.template operator()<kWarp8, 2, 32, false>();
         }
     } else {
-        launch.template operator()<8, 2, 32, false>();
+        launch.template operator()<kWarp8, 2, 32, false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

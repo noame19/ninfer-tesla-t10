@@ -1,5 +1,8 @@
-// Width-3 H16 append instantiation of the INT8-family small-T partial launch; one unit per
-// width, geometry and input keeps the long ptxas runs parallel.
+// Width-3 H16 instantiation of the INT8-family small-T partial launch, one geometry per
+// unit: `small_t_i8.cuh` is a heavy template, and instantiating several geometries in one
+// translation unit makes ptxas hold all their register pressure at once (measured: 6 GiB for
+// three geometries on one TU, enough to exhaust this host's 23 GiB when six TUs run in
+// parallel).
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.cuh"
 
 namespace ninfer::ops::detail {
