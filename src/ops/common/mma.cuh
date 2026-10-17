@@ -98,36 +98,6 @@ __device__ __forceinline__ void mma_s8_m8n8k16(int& c0, int& c1, unsigned a0, un
 }
 #endif // NINFER_SM75
 
-// bf16x2 -> f16x2 for one MMA operand pair, so a caller holding a fragment across several MMAs
-// converts it once instead of once per call. Turing has no bf16 tensor core, so every bf16 MMA
-// pays a per-element conversion; on the three k8 steps of an m16n8k16 that is 8 conversions of the
-// same A values when the inner loop walks n (the usual shape here -- see prompt_bf16.cuh's score
-// loop and chunked/output.cuh's panel). Measured on a T10 at N_TILES 8: 788 -> 1310 Gmma/s.
-//
-// Bit-identical to converting inside mma_bf16: bf162_to_f162 is a per-element function of the
-// operand with no cross-element state, so hoisting it cannot reorder or round anything.
-__device__ __forceinline__ unsigned bf16_frag_to_f16(unsigned b) {
-#if defined(NINFER_SM75)
-    return bf162_to_f162(b);
-#else
-    return b;
-#endif
-}
-
-__device__ __forceinline__ void mma_bf16_preconverted(float& c0, float& c1, float& c2, float& c3,
-                                                      unsigned a0, unsigned a1, unsigned a2,
-                                                      unsigned a3, unsigned b0, unsigned b1) {
-#if defined(NINFER_SM75)
-    mma_f16_m16n8k8(c0, c1, c2, c3, a0, a1, b0);
-    mma_f16_m16n8k8(c0, c1, c2, c3, a2, a3, b1);
-#else
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#endif
-}
-
 __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {

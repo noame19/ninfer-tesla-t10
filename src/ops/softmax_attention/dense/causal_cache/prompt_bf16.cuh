@@ -18,6 +18,7 @@
 #include <math_constants.h>
 
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+#include "ops/common/mma_bf16_hoist.cuh"
 
 namespace ninfer::ops {
 

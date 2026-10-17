@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/mma.cuh"
+#include "ops/common/mma_bf16_hoist.cuh"
 #include "ops/linear_attention/gated_delta_net/chunked/common.cuh"
 
 #include <cmath>
