@@ -42,19 +42,29 @@ mkdir -p "$OUT_DIR"
 CUBLAS_LIB="${NINFER_CUDA_LIB:-/home/agent/comfyui/.venv/lib/python3.11/site-packages/nvidia/cu13/lib}"
 export LD_LIBRARY_PATH="$CUBLAS_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# Wait for the device to be free. A leftover serve process of ours is killed; anything else is left
-# alone and reported, because the card may be someone else's.
+# Wait until the device is ours to use. A leftover serve process of ours is killed; anything else
+# is LEFT ALONE -- the card may be someone else's -- but a small resident process does not block a
+# measurement. What matters is that no ninfer process is running and that enough memory is free.
+# The floor is generous on purpose: the acceptance artifact needs ~13.2 GiB of the 16 GiB.
 free_gpu() {
-  for _ in $(seq 1 30); do
-    local used
-    used=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | head -1)
-    [ -z "$used" ] && return 0
-    for p in $used; do
-      if grep -qa ninfer "/proc/$p/cmdline" 2>/dev/null; then kill "$p" 2>/dev/null; fi
+  local floor_mib=${NINFER_T10_FREE_MIB:-14000}
+  for _ in $(seq 1 45); do
+    local busy=0
+    for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
+      if grep -qa ninfer "/proc/$p/cmdline" 2>/dev/null; then
+        kill "$p" 2>/dev/null
+        busy=1
+      fi
     done
+    if [ "$busy" = 0 ]; then
+      local free_mib
+      free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+      [ "$free_mib" -ge "$floor_mib" ] && return 0
+    fi
     sleep 2
   done
-  echo "free_gpu: device still busy: $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr '\n' ' ')" >&2
+  echo "free_gpu: still busy: $(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ' ')" >&2
+  echo "free_gpu: free $(nvidia-smi --query-gpu=memory.free --format=csv,noheader), need ${floor_mib} MiB" >&2
   return 1
 }
 

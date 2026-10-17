@@ -171,6 +171,16 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto& k      = matrix(inputs[1]);
     const auto& third  = matrix(inputs[2]);
     const auto& fourth = matrix(inputs[3]);
+    // The two registered towers are the same structural rule with different literals: attention
+    // wants the gate shaped like the query and the value like the key, GDN wants the key shaped
+    // like the query and the z like the value. The literals carry no information the structure does
+    // not, so a third tower (a 9B with `{32,4096}` or a 4B with `{32,2560}` GDN) is admitted by the
+    // rule rather than by a list; a genuine mismatch, such as the 27B's `{48,5120}` gating against
+    // a `{48,5120}` query, still fails because the *pair* no longer matches.
+    const bool portable = attention ? third == q && fourth == k && q[1] == k[1]
+                                    : k == q && third == fourth && q[1] == third[1];
+    // Which of the two native format tables the bank belongs to. Only the native path reads these;
+    // a GGUF parent carries its own quantisation, so it returns above.
     const bool dense =
         attention ? q == std::vector<std::uint64_t>{6144, 5120} &&
                         k == std::vector<std::uint64_t>{1024, 5120} && third == q && fourth == k
@@ -181,9 +191,8 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    require(dense || moe, "input projection: unsupported logical projection geometry");
+    require(portable, "input projection: unsupported logical projection geometry");
     if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
-        require(dense, "input projection: GGUF parts need the dense geometry");
         const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
         const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
         if (attention) {
@@ -260,17 +269,22 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 }
 
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
+    // The gating bank is the GDN value-head count by hidden: `{48,5120}` on the 27B, `{32,2048}` on
+    // the 35B-A3B. A 9B or 4B is `{32,4096}` or `{32,2560}`, so the pair only has to agree -- the
+    // head and hidden counts are the kernel's business, and it rejects a geometry it has no
+    // instantiation for rather than the loader refusing a tower that is otherwise sound.
     const auto& shape = matrix(a);
-    require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
-                                   shape == std::vector<std::uint64_t>{32, 2048}),
-            "GDN control: unsupported A/B geometry");
+    require(shape == matrix(b), "GDN control: A and B geometries differ");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {
         auto result = single(inputs);
         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
         return result;
     }
-    require(shape[0] == 48, "GDN control: this geometry requires a combined parent");
+    // Separate parents. `prepare_linear_weight` needs no geometry check here: the plan resolves the
+    // head and hidden counts from the tensors the Op is handed (`g.ne[0]`, `x.ne[0]`), so a tower
+    // whose gating geometry it has no instantiation for is rejected there rather than by the loader
+    // refusing a tower that is otherwise sound. The pair only has to agree.
     const auto first  = prepare_linear_weight(a);
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,

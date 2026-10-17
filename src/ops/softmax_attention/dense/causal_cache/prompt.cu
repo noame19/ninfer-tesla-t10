@@ -9,6 +9,7 @@
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
+#include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh"
 #include "core/device.h" // CUDA_CHECK
 
@@ -278,13 +279,10 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         return;
     }
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
-                                                                       metadata, out, fast, stream);
-        return;
-    }
-    causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                   metadata, out, fast, stream);
+    with_causal_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+        causal_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
+                                                               out, fast, stream);
+    });
 }
 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -316,13 +314,10 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
-        if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-            causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
-                q, positions, scale, cache, metadata, out, fast, stream);
-            return;
-        }
-        causal_attention_prompt_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                       metadata, out, fast, stream);
+        with_causal_geometry(q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+            causal_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                   metadata, out, fast, stream);
+        });
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

@@ -257,6 +257,19 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
+// The Qwen3.5 towers share a kernel template and differ only in (heads, hidden), so their
+// weight check is derived from the geometry rather than written out per shape.
+template <class Geometry>
+void require_shape_geometry(const Weight& w, const char* name) {
+    if (w.n != Geometry::kHeads || w.k != Geometry::kHidden || w.shape[0] != Geometry::kHeads ||
+        w.shape[1] != Geometry::kHidden) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " requires contiguous BF16 [" +
+                                    std::to_string(Geometry::kHeads) + "," +
+                                    std::to_string(Geometry::kHidden) + "]");
+    }
+}
+
 template <class Geometry, int SplitK>
 constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
@@ -633,6 +646,45 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
     (void)launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
                                                            a_weight, b_weight, A_log, dt_bias,
                                                            nullptr, g, beta, stream);
+}
+
+// The Qwen3.5 towers have no tuned split-K route: only the unsplit one is instantiated, which is
+// also the only route the resolver offers for them. That keeps one kernel per geometry instead of
+// the 27B's five, and the unsplit route needs no cooperative launch, so it already works on a
+// device whose shared memory cannot seat a split-K grid.
+template <class Geometry>
+void launch_geometry_unsplit(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                             const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                             const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    require_shape_geometry<Geometry>(a_weight, "a_weight");
+    require_shape_geometry<Geometry>(b_weight, "b_weight");
+    (void)launch_bf16_prefill_mma<Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                  b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                  stream);
+}
+
+void bf16_gdn_gating_proj_9_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               Tensor& g, Tensor& beta, cudaStream_t stream) {
+    launch_geometry_unsplit<Bf16Gdn9Geometry>(variant, x, a_weight, b_weight, A_log, dt_bias, g,
+                                              beta, stream);
+}
+
+void bf16_gdn_gating_proj_4_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               Tensor& g, Tensor& beta, cudaStream_t stream) {
+    launch_geometry_unsplit<Bf16Gdn4Geometry>(variant, x, a_weight, b_weight, A_log, dt_bias, g,
+                                              beta, stream);
+}
+
+void bf16_gdn_gating_proj_08_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                                const Weight& a_weight, const Weight& b_weight,
+                                                const Tensor& A_log, const Tensor& dt_bias,
+                                                Tensor& g, Tensor& beta, cudaStream_t stream) {
+    launch_geometry_unsplit<Bf16Gdn08Geometry>(variant, x, a_weight, b_weight, A_log, dt_bias, g,
+                                               beta, stream);
 }
 
 } // namespace ninfer::ops::detail
