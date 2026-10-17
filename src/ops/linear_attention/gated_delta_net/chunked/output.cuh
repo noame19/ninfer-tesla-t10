@@ -30,6 +30,8 @@ using ninfer::ops::exp2_approx;
 using ninfer::ops::ldmatrix_x2;
 using ninfer::ops::ldmatrix_x4;
 using ninfer::ops::mma_bf16;
+using ninfer::ops::mma_bf16_preconverted;
+using ninfer::ops::bf16_frag_to_f16;
 using ninfer::ops::mma_tf32;
 using ninfer::ops::smem_addr;
 
@@ -114,14 +116,19 @@ mma_bf16_panel(float (&D)[N_TILES][4], Bf16SmemTile<A_STRIDE> A,
         const int k_off = kt * BF16_MMA_K;
         unsigned af[4];
         ldmatrix_x4(af[0], af[1], af[2], af[3], smem_addr(A.ptr(a_row, a_col + k_off)));
+        // The A fragment is reused by every n tile, so on Turing -- where bf16 has no tensor core
+        // and each MMA converts its operands element by element -- convert it once here instead of
+        // N_TILES times inside the loop. Bit-identical: the conversion is per element.
+        unsigned ah0 = bf16_frag_to_f16(af[0]), ah1 = bf16_frag_to_f16(af[1]);
+        unsigned ah2 = bf16_frag_to_f16(af[2]), ah3 = bf16_frag_to_f16(af[3]);
 
 #pragma unroll
         for (int nt = 0; nt < N_TILES; ++nt) {
             unsigned bf[2];
             ldmatrix_x2(bf[0], bf[1],
                         smem_addr(B.ptr(nt * MMA_N + lane_in_8, b_col + k_off)));
-            mma_bf16(D[nt][0], D[nt][1], D[nt][2], D[nt][3], af[0], af[1], af[2], af[3],
-                     bf[0], bf[1]);
+            mma_bf16_preconverted(D[nt][0], D[nt][1], D[nt][2], D[nt][3], ah0, ah1, ah2, ah3,
+                                  bf[0], bf[1]);
         }
     }
 }

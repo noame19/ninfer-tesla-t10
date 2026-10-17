@@ -242,10 +242,16 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                                                k_as, k_r));
                 }
             }
+            // The Q fragment is shared by all QKNt score tiles; on Turing bf16 has no tensor core,
+            // so convert it once here rather than QKNt times inside mma_bf16. Bit-identical.
+            const unsigned aq0 = bf16_frag_to_f16(af[cur][0]);
+            const unsigned aq1 = bf16_frag_to_f16(af[cur][1]);
+            const unsigned aq2 = bf16_frag_to_f16(af[cur][2]);
+            const unsigned aq3 = bf16_frag_to_f16(af[cur][3]);
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
-                         af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                mma_bf16_preconverted(score[nt][0], score[nt][1], score[nt][2], score[nt][3], aq0,
+                                      aq1, aq2, aq3, bf[cur][nt][0], bf[cur][nt][1]);
             }
         }
 
@@ -388,10 +394,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                               causal_prompt_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192),
                                                      ckv, v_as, v_r));
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
-                     p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
-                     p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
+            // p_frag[k] feeds both n2 accumulators, so convert it once for the pair.
+            const unsigned ap0 = bf16_frag_to_f16(p_frag[k][0]);
+            const unsigned ap1 = bf16_frag_to_f16(p_frag[k][1]);
+            const unsigned ap2 = bf16_frag_to_f16(p_frag[k][2]);
+            const unsigned ap3 = bf16_frag_to_f16(p_frag[k][3]);
+            mma_bf16_preconverted(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], ap0, ap1, ap2,
+                                  ap3, vf[cur][0], vf[cur][1]);
+            mma_bf16_preconverted(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                                  ap0, ap1, ap2, ap3, vf[cur][2], vf[cur][3]);
         }
     }
 
