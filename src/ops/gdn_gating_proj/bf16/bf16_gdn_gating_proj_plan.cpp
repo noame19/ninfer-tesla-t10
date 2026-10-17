@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_residency.h"
+
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/rmsnorm.h"
 
@@ -120,11 +122,22 @@ std::int32_t device_sm_count() noexcept {
 }
 
 std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule, std::int32_t sm_count) noexcept {
-    return ctas_per_sm_27(schedule) * sm_count;
+    // The sm_86 figure above was measured on an SM with 100 KiB of shared memory, which seats two of
+    // the 27B BN128 kernel's 40 KiB CTAs. A Turing SM has 64 KiB and seats one, so clamp the
+    // measured figure by what this device actually admits. Without the clamp a cooperative grid the
+    // predicate calls resident is rejected by the driver with cudaErrorCooperativeLaunchTooLarge on
+    // the first wide prefill. See bf16_gdn_gating_proj_residency.h.
+    constexpr std::int32_t kCtaSmemBytes = 40960; // two stages of 128x64 plus two 16x64 bf16
+    const std::int32_t per_sm =
+        std::min(ctas_per_sm_27(schedule), shared_memory_ctas_per_sm(kCtaSmemBytes));
+    return per_sm * sm_count;
 }
 
 std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule, std::int32_t sm_count) noexcept {
-    return ctas_per_sm_35(schedule) * sm_count;
+    constexpr std::int32_t kCtaSmemBytes = 24576; // two stages of 64x64 plus two 16x64 bf16
+    const std::int32_t per_sm =
+        std::min(ctas_per_sm_35(schedule), shared_memory_ctas_per_sm(kCtaSmemBytes));
+    return per_sm * sm_count;
 }
 
 // Zero marks a schedule that is not launched cooperatively and therefore carries no residency
@@ -288,16 +301,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-#if defined(NINFER_SM75)
-            // Turing has 64 KiB of shared memory per SM and a BN128 CTA stages 40 KiB, so only one
-            // CTA is resident per SM -- not the two these split-K routes are budgeted for. A
-            // cooperative launch sized from a two-CTA budget would not fit, and the launch fails
-            // rather than falling back. Take the unsplit route, which has no grid-wide barrier and
-            // needs no cooperative launch.
-            return false;
-#else
             return cooperative_27_grid_is_resident(schedule, problem.cols, sm_count);
-#endif
         case Bf16GdnGatingScheduleId::MmaUnsplit:
             return true;
         case Bf16GdnGatingScheduleId::SimtWarpRowC4:
@@ -320,16 +324,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingPro
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-#if defined(NINFER_SM75)
-        // Same 64-KiB-per-SM limit as the 27B geometry above (BN64 needs 24 KiB per CTA and the
-        // routes budget three or four CTAs per SM): take the unsplit route on Turing.
-        (void)schedule;
-        (void)problem;
-        (void)sm_count;
-        return false;
-#else
         return cooperative_35_grid_is_resident(schedule, problem.cols, sm_count);
-#endif
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return false;
@@ -590,17 +585,10 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     if (is_27(problem) && problem.cols <= 42)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
     if (is_35(problem) && problem.cols <= 16) {
-#if defined(NINFER_SM75)
-        // This fused route is the cooperative split-32 gating, whose launch cannot fit Turing's
-        // 64 KiB of shared memory per SM. Fall through to the composed route over the unsplit
-        // control plan the resolver above already selected.
-        (void)norm_splits;
-#else
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
-#endif
     }
     const std::size_t norm_partial_bytes =
         static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);
