@@ -15,6 +15,9 @@ namespace ninfer::ops::detail {
 enum class CausalConvSplitGeometry {
     Rows2048x2048x4096,
     Rows2048x2048x6144,
+    // The 0.8B tower: 16 linear key heads and 16 linear value heads of width 128, so both the
+    // key and the value destination are 2048 rows wide and the packed conv input is 6144.
+    Rows2048x2048x2048,
 };
 
 inline constexpr std::int32_t kCausalConvParallelMaxTokens = 32;

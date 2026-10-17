@@ -1,12 +1,15 @@
 #pragma once
 
-// SM120 BF16 GDN gating projection for the two exact registered geometries:
+// SM120 BF16 GDN gating projection for the exact registered geometries:
 //
 //   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
 //   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
+//   Qwen3.5-9B:      a/b = W[32,4096] @ x[4096,T]
+//   Qwen3.5-4B:      a/b = W[32,2560] @ x[2560,T]
+//   Qwen3.5-0.8B:    a/b = W[16,1024] @ x[1024,T]
 //
 // A CTA computes the same 16 output rows from both weights over 128 (27B) or
-// 64 (35B) tokens.
+// 64 (every other geometry) tokens.
 // Split-K routes use a tuned eight- or sixteen-warp specialization and an
 // in-kernel cooperative grid reduction; the unsplit long-context route uses
 // eight warps for more independent MMA accumulators. One cooperative launch remains fused, while
@@ -48,8 +51,47 @@ struct Bf16Gdn35Geometry {
     static constexpr int kBlockN = 64;
 };
 
+// The Qwen3.5 towers. They share the 35B geometry's 32 heads and differ only in the hidden
+// width, except for the 0.8B, whose GDN has 16 value heads over a 1024-wide hidden.
+struct Bf16Gdn9Geometry {
+    static constexpr int kHeads  = 32;
+    static constexpr int kHidden = 4096;
+    static constexpr int kBlockN = 64;
+};
+
+struct Bf16Gdn4Geometry {
+    static constexpr int kHeads  = 32;
+    static constexpr int kHidden = 2560;
+    static constexpr int kBlockN = 64;
+};
+
+struct Bf16Gdn08Geometry {
+    static constexpr int kHeads  = 16;
+    static constexpr int kHidden = 1024;
+    static constexpr int kBlockN = 64;
+};
+
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn9Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn4Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn08Geometry::kHidden % kBf16GdnBlockK == 0);
+
+// Every geometry spreads its head rows over 16-row MMA tiles.
+static_assert(Bf16Gdn27Geometry::kHeads % kBf16GdnBlockM == 0);
+static_assert(Bf16Gdn35Geometry::kHeads % kBf16GdnBlockM == 0);
+static_assert(Bf16Gdn9Geometry::kHeads % kBf16GdnBlockM == 0);
+static_assert(Bf16Gdn4Geometry::kHeads % kBf16GdnBlockM == 0);
+static_assert(Bf16Gdn08Geometry::kHeads % kBf16GdnBlockM == 0);
+
+// The unsplit route accumulates the two halves of K in separate register sets, so the K-tile
+// count has to be even. The split routes divide it further; every legal SplitK is a power of
+// two and therefore keeps this property.
+static_assert((Bf16Gdn27Geometry::kHidden / kBf16GdnBlockK) % 2 == 0);
+static_assert((Bf16Gdn35Geometry::kHidden / kBf16GdnBlockK) % 2 == 0);
+static_assert((Bf16Gdn9Geometry::kHidden / kBf16GdnBlockK) % 2 == 0);
+static_assert((Bf16Gdn4Geometry::kHidden / kBf16GdnBlockK) % 2 == 0);
+static_assert((Bf16Gdn08Geometry::kHidden / kBf16GdnBlockK) % 2 == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);

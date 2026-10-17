@@ -88,4 +88,19 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
+// The Qwen3.5 towers (9B / 4B / 0.8B). They have no tuned split-K route; each is a single unsplit
+// kernel, which is also why they need no cooperative launch and fit any device's shared memory.
+void bf16_gdn_gating_proj_9_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               Tensor& g, Tensor& beta, cudaStream_t stream);
+void bf16_gdn_gating_proj_4_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               Tensor& g, Tensor& beta, cudaStream_t stream);
+void bf16_gdn_gating_proj_08_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                                const Weight& a_weight, const Weight& b_weight,
+                                                const Tensor& A_log, const Tensor& dt_bias,
+                                                Tensor& g, Tensor& beta, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

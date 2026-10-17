@@ -184,6 +184,21 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
+// The Qwen3.5 towers. 9B and 4B keep the 35B's 32 GDN value heads but widen the hidden state to
+// 4096 and 2560; the 0.8B halves the head count to 16 over a 1024-wide hidden. None of them has a
+// tuned split-K route, so each resolves to its own unsplit kernel.
+bool is_9(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 32 && problem.input_rows == 4096;
+}
+
+bool is_4(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 32 && problem.input_rows == 2560;
+}
+
+bool is_08(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 16 && problem.input_rows == 1024;
+}
+
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -203,7 +218,9 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
-    return is_35(problem) ? 64 : 128;
+    // Only the 27B geometry is tuned for 128 tokens per CTA; every other registered geometry uses
+    // 64, which is also what its own route table assumes.
+    return is_27(problem) ? 128 : 64;
 }
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
@@ -343,12 +360,21 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     DeviceSpan scratch{};
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
     const auto launch_unsplit = [&] {
-        if (is_35(problem)) {
-            bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
-                                                       A_log, dt_bias, g, beta, execution.stream);
-        } else {
+        if (is_27(problem)) {
             bf16_gdn_gating_proj_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
                                                     A_log, dt_bias, g, beta, execution.stream);
+        } else if (is_35(problem)) {
+            bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                       A_log, dt_bias, g, beta, execution.stream);
+        } else if (is_9(problem)) {
+            bf16_gdn_gating_proj_9_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                      A_log, dt_bias, g, beta, execution.stream);
+        } else if (is_4(problem)) {
+            bf16_gdn_gating_proj_4_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                      A_log, dt_bias, g, beta, execution.stream);
+        } else {
+            bf16_gdn_gating_proj_08_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                       A_log, dt_bias, g, beta, execution.stream);
         }
     };
     // The route table's static_asserts already guarantee every schedule the default dispatch
@@ -483,7 +509,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_9(problem) || is_4(problem) || is_08(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -540,8 +566,12 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    return is_27(problem) ? resolve_from_routes(k27Routes, problem, sm_count)
-                          : resolve_from_routes(k35Routes, problem, sm_count);
+    if (is_27(problem)) { return resolve_from_routes(k27Routes, problem, sm_count); }
+    if (is_35(problem)) { return resolve_from_routes(k35Routes, problem, sm_count); }
+    // The Qwen3.5 towers have one route each, so they do not need a table: the unsplit kernel is
+    // the only one instantiated for their geometry, and it needs no cooperative launch.
+    return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit, problem,
+                                             sm_count);
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,

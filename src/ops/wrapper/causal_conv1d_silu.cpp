@@ -165,6 +165,11 @@ detail::CausalConvSplitGeometry resolve_split_geometry(const Tensor& x, const Te
     if (x.ne[0] == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x6144;
     }
+    // The 0.8B tower packs 2048 query + 2048 key + 2048 value rows (16 key and 16 value heads of
+    // width 128). Checked after the 6144 case, which shares the same channel total.
+    if (x.ne[0] == 6144 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 2048) {
+        return detail::CausalConvSplitGeometry::Rows2048x2048x2048;
+    }
     throw std::invalid_argument("causal_conv1d: split received an unregistered row profile");
 }
 
