@@ -25,8 +25,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-FILLER = os.environ.get("NINFER_T10_RECALL_FILLER", "/home/agent/work-rom/ninfer-run/filler.txt")
-NOVEL = os.environ.get("NINFER_T10_RECALL_NOVEL", "/home/agent/work-rom/ninfer-run/novel.txt")
+FILLER = os.environ.get("NINFER_T10_RECALL_FILLER", "")
+NOVEL = os.environ.get("NINFER_T10_RECALL_NOVEL", "")
 NOVEL_TOKENS = 82767
 PROBES = [("DEEP", "ZXQ-7741", 0.01), ("SHAL", "ZXQ-2288", 0.50), ("TIP", "ZXQ-9034", 0.98)]
 ASK = ("请逐行回答上文三处《内部记录》的探针编号，格式：DEEP=编号，SHAL=编号，TIP=编号。")
@@ -35,10 +35,22 @@ NOVEL_TOKENS_PER_CHAR = 0.602
 FILLER_TOKENS_PER_CHAR = 0.305
 
 
+def _corpus(path: str, variable: str) -> str:
+    """Read a probe corpus, naming the environment variable when it is not configured.
+
+    The paths live in env.sh, which every rig script sources. Reading them here instead of
+    hard-coding them keeps the corpora out of the repository: the filler is generated, and the
+    narrative half is third-party text.
+    """
+    if not path:
+        raise SystemExit(f"{variable} is not set; source tools/t10-perf/env.sh first")
+    return Path(path).read_text(encoding="utf-8")
+
+
 def build_turn1(tokens: int) -> str:
     """Filler, then the novel carrying the probes -- the novel last, so DEEP is the most distant."""
-    filler = Path(FILLER).read_text(encoding="utf-8")
-    novel = Path(NOVEL).read_text(encoding="utf-8")
+    filler = _corpus(FILLER, "NINFER_T10_RECALL_FILLER")
+    novel = _corpus(NOVEL, "NINFER_T10_RECALL_NOVEL")
     novel_tokens = min(NOVEL_TOKENS, max(int(tokens * 0.4), 4000))
     novel = (novel * 4)[: int(novel_tokens / NOVEL_TOKENS_PER_CHAR)]
     parts, last = [], 0

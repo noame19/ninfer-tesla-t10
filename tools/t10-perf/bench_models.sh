@@ -31,11 +31,11 @@ DRAFT=${NINFER_T10_DRAFT_TOKENS:-2}
 
 if [ "$#" -eq 0 ]; then
   set -- \
-    "$HOME/work-rom/ninfer-convert/out/swift-27b-ud-q3_k_xl.ninfer" \
-    "$HOME/work-rom/ninfer-convert/out/qwenpaw-flash-9b-heretic.ninfer" \
-    "$HOME/work-rom/ninfer-convert/out/ornith-1.5-9b-uncensored.ninfer" \
-    "$HOME/work-rom/ninfer-convert/out/qwen3.5-4b-q4_k_m-mtp.ninfer" \
-    "$HOME/work-rom/ninfer-convert/out/qwen3.5-0.8b.ninfer"
+    "$MODELS/Qwen3.8-27B/Swift-1.5-Qwen3.8-27B-Uncensored-Dynamic-MTP-UD-Q3_K_XL.ninfer" \
+    "$MODELS/QwenPaw-Flash-9B/QwenPaw-Flash-9B-heretic-MTP-Q6_K.ninfer" \
+    "$MODELS/Ornith-1.5-9B/Ornith-1.5-9B-MTP-Q6_K.ninfer" \
+    "$MODELS/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M-MTP.ninfer" \
+    "$MODELS/Qwen3.5-0.8B/Qwen3.5-0.8B.ninfer"
 fi
 
 [ -x "$BIN" ] || { echo "$LABEL NOBINARY $BIN" >&2; exit 1; }

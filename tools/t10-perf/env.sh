@@ -11,7 +11,9 @@ T10_PERF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$T10_PERF_DIR/../.." && pwd)"
 
 # The acceptance artifact. Every speed and quality figure quoted in docs/ was taken on this file.
-MODEL="${NINFER_T10_MODEL:-/home/agent/local_model/model/Qwen3.8-27B/Qwen3.8-27B-Coder390-EfficientThink-Q2LynnStyle-Q8MTP.ninfer}"
+# Converted artifacts all live under one directory, one subdirectory per tower.
+MODELS="${NINFER_T10_MODELS:-/mnt/disk238g/ninfer_model}"
+MODEL="${NINFER_T10_MODEL:-$MODELS/Qwen3.8-27B/Qwen3.8-27B-Coder390-EfficientThink-Q2LynnStyle-Q8MTP.ninfer}"
 
 # The hand-written route profile for this card. Editing it is a zero-compile experiment.
 PROFILE="${NINFER_T10_PROFILE:-$REPO_ROOT/docs/device-profiles/t10-sm75.json}"
@@ -22,20 +24,22 @@ PPL_TEXT="${NINFER_T10_PPL_TEXT:-$T10_PERF_DIR/ppl_probe.txt}"
 # The prefill driver: posts a 14-token-per-rep sentence, so reps=800 is ~11.2k and 3400 is ~47.6k.
 AB_DRIVER="${NINFER_T10_AB_DRIVER:-$T10_PERF_DIR/ab2.py}"
 
-# The KVMem branch build (task P1). The long-context recall probe runs against this one, not
-# against the port's main-line binary, because KVMem only exists on that branch.
-KVMEM_BIN="${NINFER_T10_KVMEM_BIN:-$HOME/work-rom/ninfer-run/stage3/ninfer-serve}"
-KVMEM_PORT="${NINFER_T10_KVMEM_PORT:-18083}"
-
-# The long-context probe corpus. Both are outside the repository and both are local files.
-RECALL_FILLER="${NINFER_T10_RECALL_FILLER:-$HOME/work-rom/ninfer-run/filler.txt}"
-RECALL_NOVEL="${NINFER_T10_RECALL_NOVEL:-$HOME/work-rom/ninfer-run/novel.txt}"
-
-PORT="${NINFER_T10_PORT:-18099}"
-
-# Logs and profile captures land here and nowhere else. Transient by construction.
+# Logs, profile captures and the generated filler land here and nowhere else. Transient by
+# construction, and defined before the corpus paths that default into it.
 OUT_DIR="${NINFER_T10_OUT:-${TMPDIR:-/tmp}/ninfer-t10-perf}"
 mkdir -p "$OUT_DIR"
+
+# The long-context recall probe runs against the installed binary: KVMem is part of the main line.
+KVMEM_BIN="${NINFER_T10_KVMEM_BIN:-$HOME/.local/bin/ninfer-serve}"
+KVMEM_PORT="${NINFER_T10_KVMEM_PORT:-18083}"
+
+# The long-context probe corpus. The filler is generated from the repository's own documentation
+# (make_corpus.py) so it is never committed; the narrative half is a published novel and is kept
+# outside the tree on purpose. Point these anywhere else to override.
+RECALL_FILLER="${NINFER_T10_RECALL_FILLER:-$OUT_DIR/filler.txt}"
+RECALL_NOVEL="${NINFER_T10_RECALL_NOVEL:-$HOME/work-rom/corpus/novel.txt}"
+
+PORT="${NINFER_T10_PORT:-18099}"
 
 # The locally built binary links libcublas/libcublasLt from the CUDA wheel this host already has
 # (see .local-build/Dockerfile). Runtime needs the same directory on the loader path.

@@ -30,7 +30,24 @@ Every route change in this port is accepted or rejected on **speed and quality t
 | `dram.sh` | GPU performance counters (needs sudo): DRAM vs SM issue vs tensor utilisation. |
 | `ab2.py` | The prefill driver. Posts a 14-token sentence repeated `reps` times. |
 | `ppl_probe.txt` | The perplexity corpus (8,190 scored tokens at `--context 4096 --disjoint`). |
+| `make_corpus.py` | Generates the long-context probe filler from the tree's own Markdown. |
 | `waitfor.sh` | Block until a log shows a pattern, a job dies, or a timeout expires. Replaces `sleep N`. |
+
+## Long-context corpora
+
+The recall probes need ~10 MB of dense technical prose plus ~390 KB of narrative Chinese. Neither
+is committed: the filler is regenerated from this repository's documentation, and the narrative
+half is a published novel, i.e. third-party text that must not be redistributed.
+
+```
+./make_corpus.py                       # writes $OUT_DIR/filler.txt from docs/, *.md, bench/
+./make_corpus.py --check               # reports what is present without writing
+```
+
+The narrative corpus is supplied from outside the tree via `NINFER_T10_RECALL_NOVEL` (see
+`env.sh`). Byte equality with any earlier filler is *not* required: every consumer sizes the
+corpus from the token count it measures at runtime, so a different but equally long body of prose
+is a valid substitute.
 
 ## Conventions
 
@@ -72,19 +89,14 @@ Re-measure rather than trusting these numbers if the card, driver, or acceptance
 
 ## Baseline binaries
 
-An older build from before this line's work is kept for A/B comparison. It is the tree at commit
-`ecdd2b25` (identical source to `7cdafc8d` under `src/`, `third_party/`, `apps/`, `bench/`, `include/`),
-built for sm_75:
-
 | Binary | Path |
 |---|---|
-| serve | `~/work-rom/ninfer-run/stage1/ninfer-serve` |
-| perplexity | `~/work-rom/ninfer-run/tools/ninfer-perplexity` |
+| serve | `~/.local/bin/ninfer-serve` (installed from `build-sm75/apps/`) |
+| perplexity | `build-sm75/apps/ninfer-perplexity` |
 
-**Do not use `stage2/`** (the reverted FP16 cuBLAS route, measured −8%) or `artifact3/` (no device
-profile, no attention tiers, no two-stage GDN). Both the 8-bit `.nv_fatbin` and `--version` are
-identical across those builds, so identify a binary by the commit it came from, never by its
-self-report.
+`--version` prints `0.12.0-rtx3090+unknown` for every build of this line, so it identifies nothing.
+Identify a binary by the commit it was built from — `git log -1` at build time — never by its
+self-report, and never compare against a binary whose commit you cannot name.
 
 ## Outputs
 

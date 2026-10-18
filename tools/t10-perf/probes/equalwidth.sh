@@ -2,7 +2,7 @@
 set -u
 export LD_LIBRARY_PATH=/home/agent/comfyui/.venv/lib/python3.11/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
 BIN=/home/agent/work-rom/ninfer-t10-perf/build-sm75/apps/ninfer-serve
-ART=/mnt/disk238g/ninfer/out/Qwen3.8-27B-Q2Lynn-Q8MTP-DFlash2Q4.ninfer
+ART=/mnt/disk238g/ninfer_model/Qwen3.8-27B/Qwen3.8-27B-Q2Lynn-Q8MTP-DFlash2Q4.ninfer
 OUT=/home/agent/work-rom/ninfer-t10-perf/.perf-out
 PORT=18093
 run() {

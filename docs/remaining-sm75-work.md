@@ -136,7 +136,7 @@ still 27B-shaped**, in the places below. Positions are on `sm75`.
 ### What refuses a load (fix these first, they are validator-only) — **P0a, #4**
 
 Three local artifacts are already converted and wait for exactly this:
-`/home/agent/work-rom/ninfer-convert/out/qwen3.5-4b-q4_k_m-mtp.ninfer` (2.9 GB),
+`/mnt/disk238g/ninfer_model/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M-MTP.ninfer` (2.9 GB),
 `ornith-1.5-9b-uncensored.ninfer` (5.7 GB), `swift-27b-ud-q3_k_xl.ninfer` (12.8 GB). No conversion
 is needed. The 4B fails today with:
 

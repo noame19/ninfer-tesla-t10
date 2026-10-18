@@ -242,7 +242,7 @@ sections above describe upstream.
 One artifact is the baseline for every claim on this line:
 `/home/agent/local_model/model/Qwen3.8-27B/Qwen3.8-27B-Coder390-EfficientThink-Q2LynnStyle-Q8MTP.ninfer`.
 Do not measure against anything else unless the task names another model (the 4B/9B artifacts under
-`~/work-rom/ninfer-convert/out/` are for the dense-geometry work).
+`/mnt/disk238g/ninfer_model/` are for the dense-geometry work).
 
 Current figures and the task list are in
 [`docs/remaining-sm75-work.md`](docs/remaining-sm75-work.md). Reuse those numbers; re-measuring a

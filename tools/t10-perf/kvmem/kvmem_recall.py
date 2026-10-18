@@ -20,12 +20,24 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-FILLER = os.environ.get("NINFER_T10_RECALL_FILLER", "/home/agent/work-rom/ninfer-run/filler.txt")
-NOVEL  = os.environ.get("NINFER_T10_RECALL_NOVEL", "/home/agent/work-rom/ninfer-run/novel.txt")
+FILLER = os.environ.get("NINFER_T10_RECALL_FILLER", "")
+NOVEL  = os.environ.get("NINFER_T10_RECALL_NOVEL", "")
 NOVEL_TOKENS = 82767  # the novel's own length, in tokens; the 242k probe uses all of it
 PROBES = [("BEGIN", "ZXQ-7741", 0.01), ("MID", "ZXQ-2288", 0.50), ("END", "ZXQ-9034", 0.98)]
 QUESTION = ("上文是一部小说，其中一共出现了三处《内部记录》，每处都写了一个探针编号。"
             "请按它们在小说中出现的先后顺序，逐行回答这三个编号，格式：BEGIN=编号，MID=编号，END=编号。")
+
+
+def _corpus(path: str, variable: str) -> str:
+    """Read a probe corpus, naming the environment variable when it is not configured.
+
+    The paths live in env.sh, which every rig script sources. Reading them here instead of
+    hard-coding them keeps the corpora out of the repository: the filler is generated, and the
+    narrative half is third-party text.
+    """
+    if not path:
+        raise SystemExit(f"{variable} is not set; source tools/t10-perf/env.sh first")
+    return Path(path).read_text(encoding="utf-8")
 
 
 def build_context(budget, novel_first=False):
@@ -34,8 +46,8 @@ def build_context(budget, novel_first=False):
     The split is fixed in tokens rather than characters: the novel takes a fifth of the budget
     (capped at its own length) and the filler takes the rest, so --budget scales the whole thing.
     """
-    filler = Path(FILLER).read_text(encoding="utf-8")
-    novel  = Path(NOVEL).read_text(encoding="utf-8")
+    filler = _corpus(FILLER, "NINFER_T10_RECALL_FILLER")
+    novel  = _corpus(NOVEL, "NINFER_T10_RECALL_NOVEL")
     # 0.602 tok/char for the novel, 0.305 for the filler (measured on this tokenizer).
     novel_tokens = min(NOVEL_TOKENS, max(int(budget * 0.2), 2000))
     novel = (novel * 4)[:int(novel_tokens / 0.602)]
