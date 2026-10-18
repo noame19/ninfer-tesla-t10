@@ -1,3 +1,9 @@
+# Qwen3.8-27B Q8MTP artifact: what the weight formats add up to
+
+A breakdown of the 27B acceptance artifact's tensor payload by block format, and therefore of
+what the `Q2LynnStyle-Q8MTP` name is claiming. Arrived with the KVMem patch; kept because it is
+the only written record of that artifact's composition.
+
 主要权重格式如下：
 
 | 格式                      |    约占权重 |

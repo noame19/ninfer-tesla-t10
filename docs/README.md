@@ -57,8 +57,12 @@ This checkout carries a port to `sm_75`, and its own working references:
 | [`remaining-sm75-work.md`](remaining-sm75-work.md) | the task list, its order of execution, and every figure the port's claims rest on |
 | [`sm75-prefill-bottleneck.md`](sm75-prefill-bottleneck.md) | where the prefill time goes on this card, and which explanations were measured and falsified |
 | [`device-profiles/`](device-profiles/) | the hand-written T10 route profile, and why its tiers are spelled as they are |
+| [`notes/turing-attention-tile-budget.md`](notes/turing-attention-tile-budget.md) | the shared-memory arithmetic behind every legal attention tier on Turing |
+| [`notes/artifact-weight-formats.md`](notes/artifact-weight-formats.md) | what the 27B Q8MTP artifact's block formats add up to, by size |
 | [`../.local-build/`](../.local-build/README.md) | the local Docker toolchain (nvcc 13.4 / CMake 3.31.6 / g++-12, the versions CI uses) |
 | [`../tools/t10-perf/`](../tools/t10-perf/README.md) | the measurement harness and the two-sided acceptance gate |
+| [`../tools/t10-perf/probes/`](../tools/t10-perf/probes/README.md) | the one-off probes each documented figure came from |
+| [`kvmem-query-span.md`](kvmem-query-span.md) | why raw-prompt KVMem retrieval selected nothing, and the query clamp that fixed it |
 
 `AGENTS.md`'s "sm_75 port line" section holds the branch, build and verification rules for this
 line.
