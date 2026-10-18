@@ -1,10 +1,15 @@
+#include "ops/common/device_shared_memory.h"
 #include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_shapes_unified.h"
 #include "ops/linear/bf16/bf16_launch_unified.cuh"
 
 namespace ninfer::ops::detail::unified {
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
-    if (tokens <= 76)
+    // Same ceiling as the legacy selector: <16,8,16> stages 98,304 bytes and Turing grants
+    // 65,536, so the wide split is only launchable on a card that will admit it. Reachable on
+    // Turing through NINFER_LINEAR_ROUTES=unified, which bypasses the measured width bands.
+    if (tokens <= 76 && current_device_shared_memory_limit() >=
+                            Bf16A16SlicedKMmaSchedule<16, 8, 16>::kSharedBytes)
         return launch_bf16_sliced_k_mma<
             Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 16>, 5120>,
             pdl::Dependency::Programmatic>;

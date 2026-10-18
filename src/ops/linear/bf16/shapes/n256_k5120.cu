@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/common/device_shared_memory.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/bf16/bf16_n256_k5120.cuh"
 
@@ -35,7 +36,13 @@ void launch_grid(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
 } // namespace
 
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
-    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<16, 8>>;
+    // Both schedules stage KWarps*64 columns per pipeline step, so the wider K split owns the
+    // larger buffer: <16,8> asks for 98,304 bytes and <8,16> for exactly 65,536. On Turing only
+    // the narrow split is launchable, and it covers every token count the <=76 arm would.
+    if (tokens <= 76 && current_device_shared_memory_limit() >=
+                            Bf16N256K5120MmaSchedule<16, 8>::kSharedBytes) {
+        return launch_grid<Bf16N256K5120MmaSchedule<16, 8>>;
+    }
     return launch_grid<Bf16N256K5120MmaSchedule<8, 16>>;
 }
 
