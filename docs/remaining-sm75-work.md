@@ -312,6 +312,46 @@ before/after (a shortlist that proposes worse tokens loses more than it saves), 
 **Size.** Moderate plus a weight-conversion layer. Touches the artifact pipeline, so it is the item
 most likely to need an artifact round-trip.
 
+## P7-B — a DFlash2 draft model
+
+**CLOSED — it now runs, and it is slower than MTP on this card.** The crash that blocked it is fixed
+in `29a87912`; the measurement below is what settles the item.
+
+**The crash.** `select_bf16_n256_k5120`'s `tokens <= 76` arm launched
+`Bf16N256K5120MmaSchedule<16, 8>`, which stages `2 * (16 + 8) * 16*64 * 2 = 98,304` bytes. That is
+the DFlash2 `candidate_selector/hidden_projection` — the only `[256, 5120]` BF16 store in the port,
+so the 27B text tower never reaches it. Turing grants 65,536 bytes per block, so
+`cudaFuncSetAttribute` returned `cudaErrorInvalidValue` and `configure_cuda_device_once` aborted the
+first draft step. An `LD_PRELOAD` shim over `cudaFuncSetAttribute` produced the sequence that pinned
+it: 61,952 / 58,880 / 52,480 / 60,672 all `cudaSuccess`, then 98,304 `cudaErrorInvalidValue`.
+
+**The fix.** Both selectors (`shapes/n256_k5120.cu` and `shapes/n256_k5120_unified.cu`) compare the
+schedule's `kSharedBytes` against `cudaDevAttrMaxSharedMemoryPerBlockOptin` and fall through to the
+narrow `<8, 16>` split (exactly 65,536 B) when the wide one will not fit. The helper is
+`src/ops/common/device_shared_memory.h`. The unified arm needs the same guard because
+`NINFER_LINEAR_ROUTES=unified` bypasses the measured width bands and would select it on Turing.
+
+**Measured** (74-token code prompt, `temperature 0`, `--kv-dtype bf16`, CUDA graphs on, 512 new
+tokens, one run per arm):
+
+| arm | decode | draft accepted |
+| --- | --- | --- |
+| no speculative decoding | 19.63 tok/s | — |
+| **MTP-3** | **38.52 tok/s** | 347/489 = 71.0% |
+| DFlash2-7 | 36.75 tok/s | 395/806 = 49.0% |
+
+A fuller sweep without graphs agrees on the ordering: MTP-3 44.64, MTP-4 42.92, MTP-2 41.18,
+DFlash2-7 39.84, DFlash2-4 39.24, DFlash2-5 39.14, DFlash2-6 38.53, DFlash2-3 38.39, no spec 20.10
+(all tok/s). Every DFlash2 width loses to MTP-3, and its acceptance peaks at 7 drafts where the
+block-diffusion window is full — 54.6% against MTP's 85.8% at 3, i.e. the drafter is simply weaker
+per token spent.
+
+**Why it stays off.** Two independent reasons: it is slower here, and it is mutually exclusive with
+KVMem — `src/serve/serve_options.cpp:1912` `memory_spec_supported` admits only MTP widths 1..15, so
+choosing DFlash2 costs the 262k-context host-KV configuration. The kernel fix is kept because it is
+a real conformance bug: any Turing build that reached that arm aborted, and the DFlash2 artifact is
+still usable at decode widths DFlash2 wins on, if a future draft quant closes the gap.
+
 ## P2b — a register-staged prefill kernel
 
 **CLOSED — attempted and failed.** Kept for the evidence, not as a candidate. The branch `sm75-p2b`
