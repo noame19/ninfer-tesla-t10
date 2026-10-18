@@ -1,127 +1,123 @@
-# NInfer-all
+# NInfer · NVIDIA Tesla T10 (Turing sm_75)
 
-A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2) and Qwen3.8-Flash-Next, on the RTX 3090, RTX 4090, RTX 5090
-and RTX PRO 6000 Blackwell. It serves the OpenAI, Anthropic and llama.cpp APIs from one GPU, or from
-up to eight as pipeline stages on Linux.
+An inference engine for the Qwen3.5 model family, ported to **Turing** — the Tesla T10
+(TU102, 16 GB, compute capability 7.5). A single `ninfer-serve` binary serves the OpenAI,
+Anthropic and llama.cpp APIs from one card.
 
-NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
-carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
-The [documentation map](docs/README.md) lists the guides and references.
+This repository is a fork of [NInfer-all](https://github.com/iamwavecut/ninfer-all), which continues
+[NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line. The upstream engine targets
+Ampere, Ada and Blackwell; everything here is the work of making it run, and then run *well*, on the
+oldest architecture upstream's compatibility path still touches.
 
-## Tesla T10 (Turing sm_75) port
+## What Turing is missing, and what the port does about it
 
-This fork adds an `sm_75` target so the engine runs on an **NVIDIA Tesla T10** (TU102, 16 GB,
-compute capability 7.5), keeping the GGUF block-format support this line carries so a mixed
-`gguf_q4_k` / `gguf_iq3_s` / `gguf_iq4_xs` / … artifact loads unchanged.
+Two hardware facts drive almost every change:
 
-Turing is the oldest device the Ampere/Ada compatibility path serves, and it is missing two things
-that path assumed:
-
-* **No `cp.async`** (added in Ampere). `src/ops/common/memory.cuh` falls back to synchronous
-  register-staged copies with `cp_commit`/`cp_wait` as no-ops; every staging loop already ends in a
-  `__syncthreads()`, which is what publishes the data.
-* **No `m16n8k16`/`m16n8k32` tensor-core shapes.** Turing's f16 and int8 MMA shapes are `m16n8k8`
-  and `m8n8k16`. `src/ops/common/mma.cuh` emulates `m16n8k16` (f16 and f16-accumulate) as two
-  `m16n8k8`, `m16n8k32` (s8) as four `m8n8k16`, and tf32 `m16n8k8` by gathering its more widely
-  distributed operands onto the f16 unit. `ldmatrix` exists on Turing, so fragment assembly is
-  unchanged.
+* **No `cp.async`** (added in Ampere). `src/ops/common/memory.cuh` stages copies through registers
+  with `cp_commit`/`cp_wait` as no-ops; every staging loop already ends in `__syncthreads()`, which
+  is what publishes the data.
+* **No `m16n8k16` / `m16n8k32` tensor-core shapes.** Turing's f16 and int8 MMA shapes are
+  `m16n8k8` and `m8n8k16`. `src/ops/common/mma.cuh` emulates `m16n8k16` as two `m16n8k8` and
+  `m16n8k32` (s8) as four `m8n8k16`. `ldmatrix` exists on Turing, so fragment assembly is unchanged.
 
 `CMakeLists.txt` admits `75`, runs the `NINFER_SM8X_COMPAT` path for it and defines `NINFER_SM75`.
-FP8 A8 and NVFP4 W4A4 stay stubbed as they are for `sm_86`. CUDA 13 still supports `sm_75`, so the
-build uses the same toolkit as the other targets.
+FP8 A8 and NVFP4 W4A4 stay stubbed, as they are for `sm_86`. An `sm_75` build runs only on Turing.
 
-Build (the artifacts are produced by `.github/workflows/build-sm75.yml` on GPU-less runners):
+## Measured on a Tesla T10
+
+27B acceptance artifact (GGUF block formats, `rk4v4-e8` KV), 56 SMs, one request.
+
+| Workload | Before the port's optimisations | Now |
+|---|---:|---:|
+| 11.2k-token prefill | 455.5 tok/s | **531 tok/s** |
+| 47.6k-token prefill | 358.4 tok/s | **463 tok/s** |
+| 98k-token prefill | 276.2 tok/s | **299 tok/s** |
+| decode, 262k context | — | **17.8 tok/s** |
+| perplexity (8,190 scored tokens) | 3.01334 | **3.00762** |
+
+Perplexity is measured on both sides of every change and is the correctness gate; the table's
+figure *improved*, which is the point — no optimisation here trades quality for speed.
+
+## Optimisations that landed
+
+Five changes survived measurement. Each one is a commit on the main line with its before/after in
+the message.
+
+**1. `rk4v4-e8` KV cache** — 4-bit keys and values with 8-bit exponential scales. On Turing this
+raised the usable context from about 24k to about 98k tokens, and int8 KV had already given +31%
+decode over bf16 at 32k. Decode sits at the memory wall and is closed as such.
+
+**2. A hand-written T10 route profile** — `docs/device-profiles/t10-sm75.json` picks the kernel
+route for every operation and width from what was measured on this card, instead of inheriting a
+profile tuned on an RTX 3090.
+
+**3. Honest attention tiers** (`db404f24`, `66b4bb61`, `054c56ef`) — the profile's attention tiers
+named 2 CTAs/SM, but each one needs 49,216 B of shared memory (16,448 static + 32,768 dynamic)
+against Turing's 65,536 B, so only one can ever be resident. The compiler was sinking registers for
+a residency that could not happen. Retiring the unfillable `x2` tiers and naming every INT8-family
+key so the profile can reach all five codings gave **+2.5% at 11.2k, +7.7% at 47.6k and +8.3% at
+98k**, at bit-identical perplexity.
+
+**4. Decode at the memory wall** — a decode step reads 15.29 GiB of weights once and cannot do
+better; measured at 82% of the card's 394 GB/s. The remaining levers were the draft path and the
+attention route, both taken below.
+
+**5. MTP and DFlash2 speculative decoding** — `--spec mtp` measured **2.55× over plain decode** on
+this card (52.7 against 20.7 tok/s with 4 drafts). `--spec dflash2` is implemented and works, but
+measured *slower* than MTP here (39.8 against 44.6 tok/s at its best width), so MTP is the default.
+The optimum draft width on a Tesla T10 is **2** (39.4 tok/s at 84.5% acceptance); wider drafts fall
+off as acceptance drops.
+
+### Tried, measured, and rejected
+
+Recorded so the next person does not repeat them. Each was reverted; the numbers are in the commit
+messages and `docs/sm75-prefill-bottleneck.md`.
+
+| Attempt | Result |
+|---|---|
+| FP16 dequantize + cuBLAS prefill | −8%: staging every weight through FP16 costs 108 GB per chunk |
+| Staging GGUF vector-kernel loads in shared memory | 20.5 → 19.3 tok/s; L1 sectors fell 35%, DRAM bytes did not move |
+| Register-staged pipelined MMQ prefill | −1.7%, bit-identical perplexity: every kernel grew registers and `__syncthreads()` doubled |
+| `__launch_bounds__(128,4)` on the GGUF vector kernel | +0.3%: occupancy is not the bottleneck |
+| `__launch_bounds__(128,8)` on the same kernel | −67% at width 4, −79% at width 5: it spills |
+| A narrower MMQ column tile for verify steps | J=16 already reads the weights once and is still 20% slower than the vector kernel |
+
+## Building
+
+Local Docker, not CI — a CI round costs about 1.7 GB of artifact downloads, and this build is
+reproducible offline:
 
 ```bash
-cmake -S . -B build-sm75 -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=75 -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF
-cmake --build build-sm75 -j
+docker build -t ninfer-sm75-build .local-build
+.local-build/build.sh scripts/build-native.sh configure
+.local-build/build.sh scripts/build-native.sh target ninfer-serve ninfer-perplexity
 ```
 
-An `sm_75` build runs only on Turing (Tesla T10, RTX 2080 Ti, …); the Ampere/Ada builds do not run
-on it, and it does not run on `sm_86`.
+The image is Debian 12 with the same versions CI uses (nvcc 13.4, CMake 3.31.6, g++-12). CUDA
+headers and cublas are taken read-only from a CUDA 13 wheel already on the host, which avoids
+downloading `libcublas-dev` (837 MB). See [`.local-build/README.md`](.local-build/README.md).
 
-## Highlights
+A cold build is about 3.5 hours; an incremental one is minutes.
 
-### Ternary Bonsai 2 27B and Qwen3.8-27B
+## Serving
 
-Measured in September 2026, one card each, greedy, one request unless the row says otherwise.
-Setups and full tables: [reference measurements](docs/performance/reference-2026-09.md).
+```bash
+ninfer-serve MODEL.ninfer --host 127.0.0.1 --port 8080 \
+  --max-context 262144 --kv-dtype rk4v4-e8 \
+  --prefill-chunk 1024 --spec mtp --draft-tokens 2
+```
 
-| | RTX 3090 | RTX 4090 | RTX 5090 | RTX PRO 6000 |
-|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B**, short chat (DFlash2, 7 drafts) | 202 tok/s | 256 tok/s | 397 tok/s | 381 tok/s |
-| decode after a 261K-token document (fastest drafter) | 90 tok/s | 123 tok/s | 218 tok/s | 218 tok/s |
-| time to first token for a 261K-token prompt | 215 s | 102 s | 82 s | 78 s |
-| largest context, filled and all three needles found | 970,752 | 958,464 | 978,944 | 1,048,576\* |
-| eight requests at once (MTP, 3 drafts), total | 551 tok/s | 824 tok/s | 1,063 tok/s | 1,155 tok/s |
-| **Qwen3.8-27B**, short chat (DFlash2, 7 drafts) | 118 tok/s | 149 tok/s | 236 tok/s | 237 tok/s |
-| largest context, filled and all three needles found | 417,792 | 405,504 | 872,448 | 1,048,576\* |
-| eight requests at once (MTP, 3 drafts), total | 329 tok/s | 442 tok/s | 690 tok/s | 739 tok/s |
+`--kv-dtype rk4v4-e8` is the all-round choice on a 16 GB card. `--draft-tokens 2` is the measured
+optimum. The INT8-family KV formats route to the fast prompt-attention kernel automatically on
+Turing, because there it is the only prompt kernel that fits in shared memory.
 
-\* The engine's ceiling. The RTX PRO 6000 (96 GB) starts there with every KV format and drafter;
-filled to it, both models find two of the three needles.
+## Documentation
 
-- **RTX PRO 6000 against RTX 5090.** Re-measured in October beside an RTX 5090, both at 600 W, the
-  PRO 6000 came back within 2% of September wherever the drafts accepted the same share. One
-  request's decode is bound by memory bandwidth, and both cards have 1.79 TB/s of GDDR7 (Bonsai 2
-  without speculation: 167.7 against 170.4 tok/s). The PRO 6000's 188 SMs against 170 show where
-  compute decides: the 261K prompt is 2% faster and eight requests at once 6 to 7% faster
-  ([re-check](docs/performance/reference-2026-09.md#re-check-october-2026)).
-- **Draft length.** DFlash2 with seven drafts is fastest on short answers; after long documents the
-  best count is three to seven. MTP runs up to fifteen drafts and is fastest at three to five.
-- **Past the native window.** Filled to about 880K tokens, Bonsai 2 returned all three planted codes
-  on every card. At 1,048,576 tokens (RTX 5090 and PRO 6000 only) it misses the one at 943K.
-
-### Qwen3.8-Flash-Next
-
-One request, greedy, October 2026. Each cell is **decode of a short answer · prefill of a
-4,463-token prompt**, in tok/s. Decode after the long prompt, memory, host links and power limits:
-[Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md#measurements).
-
-**Q2_0** (35.9 GiB model + 26.8 GiB n-gram table):
-
-| Experts | RTX PRO 6000 | RTX 5090 | RTX 4090 | RTX 3090 |
-|---|---:|---:|---:|---:|
-| on the GPU (two cards, except the PRO 6000) | 138 · 2,939 | 136 · 3,809 | 97 · 3,608 | 90 · 1,504 † |
-| in pinned host memory | 55 · 1,297 | 74 · 1,677 | 53 · 1,138 | 49 · 842 |
-| on disk, the files in the page cache | 76 · 2,024 | 68 · 1,739 | 42 · 723 | 47 · 630 |
-| on disk, cold (pages evicted every second) | 35 · 1,000 | 25 · 694 | 18 · 160 | 17 · 195 |
-
-† Two RTX 3090 Ti.
-
-The host and disk rows were measured before the October 9 decode work. Host experts on an RTX 3090
-now decode 87-94 tok/s in a different workload, 98-100 with a repeated prompt
-([host experts on one RTX 3090](docs/qwen3-8-flash-next.md#host-experts-on-one-rtx-3090)).
-
-**IQ3_S** (51.9 GiB model + the same table):
-
-| Experts | RTX PRO 6000 | RTX 5090 | RTX 3090 |
-|---|---:|---:|---:|
-| on the GPU (two cards for the RTX 5090) | 125 · 2,541 | 122 · 3,326 | — |
-| in pinned host memory | 29 · 803 | 41 · 1,100 | 34 · 533 |
-| on disk, the files in the page cache | 66 · 1,661 | 55 · 439 | 19 · 209 ‡ |
-| on disk, cold | 29 · 773 | 19 · 171 | 11 · 47 |
-
-— Not measured: every expert needs three 24 GB cards. ‡ The host's 62 GB of RAM cached only part
-of the file.
-
-**Coder IQ1_M** (28.4 GiB model + the same table), one NVIDIA L40S (48 GB):
-
-| Experts | NVIDIA L40S |
-|---|---:|
-| in pinned host memory | 35 · 1,648 |
-| on disk, the files in the page cache | 42 · 1,938 |
-
-- **The host matters.** Host and disk rows depend on the host as much as on the card. The RTX 5090
-  host had PCIe 5.0 x16; the others had PCIe 4.0 x16.
-- **The PRO 6000 caches almost everything.** Its 96 GB device expert cache ends up holding nearly
-  every expert.
-- **RTX 4090 host pinning.** The RTX 4090 rows ran pinned to the GPUs' NUMA node in a two-socket VM.
-  Unpinned, host experts decode there at 40 tok/s and disk experts at 32 to 33.
-- **Many requests at once.** Six reasoning requests at once on two RTX 5090s produced 193 tok/s of
-  output with Q2_0.
+Upstream's guides still apply, with the port's additions indexed in
+[`docs/README.md`](docs/README.md#sm_75-tesla-t10-port): the task list and every figure the port's
+claims rest on, where prefill time actually goes, the T10 device profile, the local Docker
+toolchain, and the measurement harness in [`tools/t10-perf/`](tools/t10-perf/README.md).
+[`AGENTS.md`](AGENTS.md) records the branch, build and verification rules this line follows.
 
 ## Features
 
@@ -440,23 +436,9 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 `NINFER_IMAGE_ARCH=sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .` builds
 the image from source (`--build-arg ARCHS=86` for one architecture).
 
-## Building
-
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build --target ninfer-serve ninfer-calibrate
-```
-
-`CMAKE_CUDA_ARCHITECTURES` is `86` for the RTX 30 series (that build also runs the RTX 40 series),
-`89` for the RTX 40 series and `120a` for the RTX 50 series and the RTX PRO 6000 Blackwell (on the
-`mma.sync` compatibility path, which the ternary route needs). CUDA 12.8 or newer builds `86` and
-`89`; a `120a` build needs CUDA 13.1 or newer, since 12.8 and 12.9 miscompile sm_120a kernels and
-configure refuses them. The [Linux](docs/build-linux.md) and [Windows](docs/build-windows.md)
-guides cover dependencies, the opt-in build options and the launcher scripts;
-[tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
-
 ## License
 
 Apache-2.0, as upstream. The Bonsai artifact's weights come from PrismML, ProCreations and Qwen,
 all Apache-2.0; its card lists the notices. The Qwen3.8-Flash-Next artifacts carry the Qwen
-Community License 1.0 of their model.
+Community License 1.0 of their model. Weights you convert yourself carry the licence of the release
+they came from.
