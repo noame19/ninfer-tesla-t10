@@ -302,8 +302,24 @@ reports `kvmem` for the KVMem model only.
 
 ### E3 — The unload path with KVMem attached · branch `sm75-p13-router-kvmem` (measurement)
 
-**Measured while verifying E4**, which is the only way this could be measured: two KVMem models
-behind one router on a 16 GiB card do not fit together, so every request crosses the eviction path.
+**Measured while verifying E4**, which is the only way this could be measured: two 27B/9B KVMem
+models behind one router on a 16 GiB card do not fit together, so every request crosses the eviction
+path.
+
+**The coexistence question, answered by three configurations rather than one.** What matters to an
+operator is not whether KVMem and the router can be made to start together, but whether two models
+stay resident:
+
+| second model | both load-on-startup | `models-max 2` | result |
+|---|---|---|---|
+| 9B KVMem + 0.8B ordinary | yes | 2 | **both resident**, alternating requests answer in 0.53/0.79 s then 0.30/0.07 s |
+| 9B KVMem + 0.8B KVMem | yes | 2 | **both resident**, same pattern (0.59/0.48 s then 0.26/0.08 s) |
+| 27B KVMem + 9B KVMem | yes | 2 | does not fit in 16 GiB; each request evicts and reloads the other |
+
+So KVMem does not force serial residency, and it is not the KVMem that fills the card -- 16 GiB holds
+a 9B plus a 0.8B with KVMem on both. The rule is the ordinary one: `models-max 2` keeps two models
+resident whenever the card can hold them, and evicts by unload (never sleep, because a KVMem Engine
+cannot be suspended) only when it cannot.
 
     21:13:40  capacity | q8mtp   loaded        runtime 1.99 GiB | free 1.32 GiB
     21:14:04  capacity | ornith15 loaded       runtime 1.46 GiB | free 7.13 GiB    (q8mtp unloaded)
