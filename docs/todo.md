@@ -191,7 +191,28 @@ The naive table is therefore **not** a merge candidate. What is left is a per-wi
 the decode workload, and keep a table only if the combined effect is a gain. The judgement is on
 overall speed, not on prefill alone.
 
-Acceptance: a table whose measured effect is positive on both workloads, or a recorded rejection.
+**Result: done, and the answer is no.** A3 made the instrument able to name an `h16` key, and a
+default calibration (repeat 11) produced a full table for all five codings. Measured on
+Ornith-1.5-9B-MTP-Q6_K, interleaved A/B, 3 rounds at 11.2k and 3 at 47.6k, `--spec mtp
+--draft-tokens 2`:
+
+| Workload | shipped profile | with the calibrated `h16` table | delta |
+|---|---|---|---|
+| 11.2k prefill | 1.553 k tok/s | 1.547 | −0.4 % |
+| 47.6k prefill | 1.393 | 1.390 | −0.2 % |
+| 47.6k decode | 176.8 tok/s | 177.1 | +0.2 % |
+| 47.6k total | 34.6 s | 34.7 s | within the card's spread |
+
+All of that is inside this card's run-to-run spread. A control says the key *is* live rather than
+ignored: forcing every `h16` width onto `2x4x32`, the worst tier the catalog offers, costs 7.0 % of
+decode at 47.6k (179.1 → 166.5 tok/s), reproduced on both rounds. So the mechanism works, the table
+is real, and there is nothing to win: attention is 3.4 % of a 9B prefill (nsys) and a few percent of
+its decode step, where the weight read dominates. The 27B's `h24` tiers were worth 2 % at 47.6k
+because that tower spends far more of a step in attention.
+
+The branch is kept with this record and no profile change, per the rule that no branch on this line
+is deleted — a reviewer may want the sweep's numbers, or to retry it on a tower whose attention
+share is larger. Do not merge it: it changes nothing.
 
 ### C3 — Does this port carry the 512-wide Turing tile race? · branch `sm75-p16-attn-race`
 
