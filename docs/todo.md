@@ -27,6 +27,19 @@ of them by testing that model alone.
 | `sm75-p15-attn-h16` | C1 | Depends on A3 (the calibration instrument cannot name an `h16` key before it); long GPU sweep. | ~2 min + GPU |
 | `sm75-p16-attn-race` | C3 | Independent kernel investigation; needs its own branch because it may touch the prompt kernels. | ~30-100 min if a kernel edit is needed |
 
+## Status
+
+Nothing below is merged. Each branch is pushed and waits for the operator's decision; a merge into
+`sm75` happens only after that, per the rule in `AGENTS.md`.
+
+| Item | Branch | State | Measured |
+|---|---|---|---|
+| A1 | `sm75-p10-gdn-routes` | built, verified, pushed `88c4b7f8` | +2.5…+6.6 % prefill on 9B/4B, PPL 3.98352→3.96913 and 4.52763→4.51396 |
+| A3 | `sm75-p11-calibration` | built, verified, pushed `666ff805` | h16 and h8 keys now calibrate (30 each); new catalog digest `309d442b79cbd8f4` |
+| B1 | `sm75-p12-vision` | built, verified, pushed `cca63802` | 9B vision resident: was `FATAL q8 linear: unsupported shape`, now encodes an 8.6 KB PNG in 4.6 s |
+| E1, E2 | `sm75-p13-router-kvmem` | built, verified, pushed `f9d97bfe` | full card refuses with both figures; `--kvmem-` on the command line names the fix |
+| A2 | `sm75-p10-gdn-routes` | **blocked on a decision** | +11.1 % prefill on the 0.8B but PPL 6.3419→6.35792 (+0.253 %), reproduced twice |
+
 ## Items
 
 ### A1 — T10 profile: `gdn_two_stage/h32` (9B, 4B) · branch `sm75-p10-gdn-routes`

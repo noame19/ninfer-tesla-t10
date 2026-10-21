@@ -309,16 +309,20 @@ gate. The rules that were learned the hard way:
 
 ### Working in parallel
 
-Several items can be in flight at once, and a long compile or a long measurement must not hold the
-session:
+A long compile or a long measurement must not hold the session:
 
 * **Anything expected to run past ~10 minutes goes to the background**, with its output in a file,
   and the session moves to the next item's reading or writing instead of waiting.
-* **A second source tree is how two builds coexist.** `~/work-rom/ninfer-t10-perf` is the tree that
-  builds and measures; a sibling checkout can be made for the next item's development while this one
-  compiles. `build-sm75/` and `.ccache/` are symlinks onto `/mnt/disk238g`, and `.local-build/build.sh`
-  derives its bind mounts from its own location, so a second checkout needs its own copies of those
-  two symlinks (or `NINFER_BUILD_DIR`/`CCACHE_DIR` pointing at separate directories).
+* **One tree, one build, one branch at a time.** `~/work-rom/ninfer-t10-perf` is the only checkout:
+  do not make sibling copies, extra worktrees or extra build directories for a second item, and do
+  not create new top-level directories under `~/work-rom/` for scratch work — this host's `/` is at
+  80% and each build tree is 5-8 GiB, so the directories pile up fast and the operator has to clean
+  them out. Work is sequential: finish the item on its branch, push it, then switch branches for the
+  next one. A long build still goes to the background, but the background work is a *measurement* on
+  the one build, or reading and writing for the next item — not a second compile.
+* **Never fast-forward a branch into `sm75` to "keep it current".** A branch reaches `sm75` only
+  through the merge rule above, with the operator's agreement. `git merge`/`git pull` between a task
+  branch and `sm75` in either direction is that merge.
 * **Grouping rule.** Two items share a branch when they are the same class of change *and* their
   effects land on different models or different workloads, so a regression is still attributable by
   testing one model alone. Sharing a directory is not sufficient reason to share a branch; sharing a
