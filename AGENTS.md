@@ -282,12 +282,15 @@ experiment that is not a task in one of those lists gets no branch.
   unchanged.** Speed tasks show measured prefill/tok-s against the recorded figures; capability tasks
   show the artifact starting and running. Numerics-touching changes must show PPL on the same build,
   bit-exact for pure data movement (3.01334 for the acceptance artifact).
-* **A failed experiment still gets a commit** with its measurement and why it lost, then the branch
-  is deleted. Do not leave it merged. `docs/sm75-prefill-bottleneck.md` and the P2b entry in the
-  task list are the model for this.
+* **A failed experiment still gets a commit** with its measurement and why it lost, and the branch
+  is **kept, never deleted.** Do not leave it merged. `docs/sm75-prefill-bottleneck.md` and the P2b
+  entry in the task list are the model for the record.
 * **Push after merging.** `git push` on this line's branch name is the backup.
-* **Do not create branches that are not a task**, do not commit work-in-progress without a
-  measurement, and do not leave stale branches behind.
+* **Do not create branches that are not a task**, and do not commit work-in-progress without a
+  measurement. **Never delete a branch on this line, merged or not, positive or negative**: the
+  operator reviews them afterwards for findings a single measurement may have missed, and a deleted
+  branch cannot be reviewed. Superseded work stays as a branch with a commit that says what it was
+  and why it was set aside.
 * **`sm75-kvmem-official` belongs to the KVMem work (task P1).** Its own upstream line carries it and
   its workflow copy still builds on push. Merge this line's work into it rather than the reverse
   until P1 lands.
@@ -340,9 +343,9 @@ This is not a "merge when convenient" rule; it is the acceptance gate for the wh
   user's judgement is that the idea may still have room, so they are kept aside rather than merged.
   Do not merge them into `sm75` "because upstream has the same change" or because the diff is small.
 * **A branch whose experiment is a clear, measured regression gets one commit recording what was
-  tried and its numbers, then the branch is deleted.** The measured-and-rejected history in
-  `docs/sm75-prefill-bottleneck.md` and the P2b entry of the task list is the pattern. A failure is
-  recorded once, not carried as a live branch.
+  tried and its numbers, and is then left alone -- not merged, and not deleted.** The
+  measured-and-rejected history in `docs/sm75-prefill-bottleneck.md` and the P2b entry of the task
+  list is the format. A failure is recorded once; the branch stays available for review.
 * **Only a change that is measured to be a real speedup, a real fix, or a real capability, with no
   compensating cost such as lower answer quality, less stable inference, or a new failure mode,
   is submitted, and only after the user has agreed to it.** Say what was measured, on which
