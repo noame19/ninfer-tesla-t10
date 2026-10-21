@@ -236,6 +236,9 @@ private:
     // The device's free memory, and what a model needs of it.
     [[nodiscard]] static std::optional<std::uint64_t> device_free_bytes();
     [[nodiscard]] static std::optional<std::uint64_t> model_device_bytes(const ModelDefinition& model);
+    // The host payload budget a KVMem model pins for as long as it is loaded; zero when it does
+    // not use KVMem. Two loaded KVMem models each pin their own, so it belongs in the room check.
+    [[nodiscard]] static std::uint64_t model_host_bytes(const ModelDefinition& model);
     void put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void unload_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void publish_locked(std::size_t index);

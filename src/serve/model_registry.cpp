@@ -1,6 +1,7 @@
 #include "serve/model_registry.h"
 
 #include "artifact/reader.h"
+#include "runtime/engine/host_memory.h"
 
 #include <cuda_runtime.h>
 
@@ -225,23 +226,53 @@ std::optional<std::uint64_t> ModelRegistry::model_device_bytes(const ModelDefini
     } catch (const std::exception&) { return std::nullopt; }
 }
 
+std::uint64_t ModelRegistry::model_host_bytes(const ModelDefinition& model) {
+    // KVMem pins a host payload budget per Engine and this is the one reservation a router can
+    // double without any device allocation getting smaller: two KVMem models at --kvmem-host-mib
+    // 5120 hold ten gibibytes of host between them, whatever the card is doing. Its disk tier is
+    // a quota rather than a pin, so it is not counted.
+    return model.options.kvmem.host_bytes;
+}
+
 bool ModelRegistry::device_has_room_locked(std::size_t index, std::string* why) const {
     if (!policy_.enforce_device_room) { return true; }
-    const std::optional<std::uint64_t> free_bytes = device_free_bytes();
-    if (!free_bytes) { return true; }
-    const std::optional<std::uint64_t> needed = model_device_bytes(models_[index].definition);
-    if (!needed) { return true; }
-    if (*needed <= *free_bytes) { return true; }
-    if (why != nullptr) {
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "'%s' needs %llu MiB on the device and %llu MiB is free",
-                      models_[index].definition.id.c_str(),
-                      static_cast<unsigned long long>((*needed + (1ULL << 20) - 1) >> 20),
-                      static_cast<unsigned long long>(*free_bytes >> 20));
-        *why = line;
+    const ModelDefinition& definition = models_[index].definition;
+    if (const std::optional<std::uint64_t> free_bytes = device_free_bytes()) {
+        if (const std::optional<std::uint64_t> needed = model_device_bytes(definition)) {
+            if (*needed > *free_bytes) {
+                if (why != nullptr) {
+                    char line[256];
+                    std::snprintf(line, sizeof(line),
+                                  "'%s' needs %llu MiB on the device and %llu MiB is free",
+                                  definition.id.c_str(),
+                                  static_cast<unsigned long long>((*needed + (1ULL << 20) - 1) >> 20),
+                                  static_cast<unsigned long long>(*free_bytes >> 20));
+                    *why = line;
+                }
+                return false;
+            }
+        }
     }
-    return false;
+    // The host budget is checked the same way and for the same reason: releasing an idle model
+    // returns both, so `evict_idle_locked` is the right response to either shortfall.
+    const std::uint64_t host_needed = model_host_bytes(definition);
+    if (host_needed != 0) {
+        if (const std::optional<std::uint64_t> host_free = runtime::available_host_memory_bytes()) {
+            if (host_needed > *host_free) {
+                if (why != nullptr) {
+                    char line[256];
+                    std::snprintf(line, sizeof(line),
+                                  "'%s' pins %llu MiB of host KVMem and %llu MiB is available",
+                                  definition.id.c_str(),
+                                  static_cast<unsigned long long>((host_needed + (1ULL << 20) - 1) >> 20),
+                                  static_cast<unsigned long long>(*host_free >> 20));
+                    *why = line;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool ModelRegistry::evict_idle_locked(std::unique_lock<std::mutex>& lock, std::size_t keep) {
