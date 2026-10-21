@@ -29,16 +29,27 @@ of them by testing that model alone.
 
 ## Status
 
-Nothing below is merged. Each branch is pushed and waits for the operator's decision; a merge into
-`sm75` happens only after that, per the rule in `AGENTS.md`.
+**A1, A2, A3, B1-B4, D2, D3, E1, E2 and E4 are merged into `sm75` (A2 at `f72e8c6f`),** verified
+there by rebuilding and re-measuring every model:
+
+| Model | PPL after the merge | Was |
+|---|---|---|
+| Qwen3.8-27B | 3.00762 | 3.00762 (unchanged) |
+| Ornith-1.5-9B | **3.96913** | 3.98352 (A1 improved it) |
+| Qwen3.5-4B | **4.51396** | 4.52763 (A1 improved it) |
+| Qwen3.5-0.8B | 6.35792 | 6.3419 (A2's cost, the operator accepted it) |
+
+The three GDN keys are live and independent, proven by `NINFER_GDN_TWO_STAGE=0` on the merged build:
+it returns the 0.8B to 6.3419 and the 9B to 3.98352, i.e. each tower consults its own key. Vision was
+re-verified after the merge too -- the 9B encodes an image in 2.8 s on the GPU.
+
+Nothing else is merged. A branch that was only tested is not a merge candidate:
 
 | Item | Branch | State | Measured |
 |---|---|---|---|
-| A1 | `sm75-p10-gdn-routes` | built, verified, pushed `88c4b7f8` | +2.5…+6.6 % prefill on 9B/4B, PPL 3.98352→3.96913 and 4.52763→4.51396 |
-| A3 | `sm75-p11-calibration` | built, verified, pushed `666ff805` | h16 and h8 keys now calibrate (30 each); new catalog digest `309d442b79cbd8f4` |
-| B1 | `sm75-p12-vision` | built, verified, pushed `cca63802` | 9B vision resident: was `FATAL q8 linear: unsupported shape`, now encodes an 8.6 KB PNG in 4.6 s |
-| E1, E2 | `sm75-p13-router-kvmem` | built, verified, pushed `f9d97bfe` | full card refuses with both figures; `--kvmem-` on the command line names the fix |
-| A2 | `sm75-p10-gdn-routes` | **blocked on a decision** | +11.1 % prefill on the 0.8B but PPL 6.3419→6.35792 (+0.253 %), reproduced twice |
+| C1 | `sm75-p15-attn-h16` | **kept unmerged** | the calibrated h16 table moves prefill −0.4 % / −0.2 %, decode +0.2 %: inside this card's spread |
+| C3 | `sm75-p16-attn-race` | **kept unmerged** | not exposed: this tree has no `ggml_fattn.cu`, so the 512-wide tile it raced on does not exist here |
+| D1 | (none — merged as documentation) | **no clamp to add** | a 147k-token prompt answered at five needle positions against a 51,200-token pool; 168k of history recalled in turn 3 |
 
 ## Items
 
