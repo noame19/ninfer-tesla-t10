@@ -207,6 +207,35 @@ decide whether a fix is in scope.
 Acceptance: either a concrete defect with a reproducer, or a statement with evidence that this
 port's kernels are not exposed.
 
+**Result: not exposed, and the reason is structural.** The race upstream fixed lives in
+`src/ops/linear/gguf/ggml_fattn.cu` -- a NInfer-side flash-attention file built on llama.cpp's
+vendored `fattn` kernels -- and **this tree has no such file**:
+`ls src/ops/linear/gguf/ | grep -i fattn` is empty, and `third_party/ggml-quants` carries only the
+MMQ path (`mmq.cuh`, `mmq-*.cuh`, `dequantize.cuh`, `mma.cuh`) because that is all this port's GGUF
+bridge compiles. `third_party/ggml-quants/README.ninfer.md` says the same: "NInfer compiles ggml's
+integer tensor-core matrix multiplication (`ggml-cuda/mmq.cuh`) and its dequantizers".
+
+The 512-wide tile that raced is part of their `fattn` tile selection. This port's attention is a
+different code base entirely -- `causal_cache/` (`prompt_i8_fast.cuh`, `small_t_i8*`, `small_t.cu`)
+plus `packed/` for vision -- and the kernel the INT8 family actually takes on Turing keeps its
+scores, probabilities and D256 accumulator **in registers**, with one warp per row block and no
+shared score tile to combine
+(`prompt_i8_fast.cuh:9-12`: "scores, probabilities and the D256 output accumulator never leave
+registers and no warp..."; the file has a single `__syncthreads()` in its two-stage loop).
+
+The one kernel in this tree that does hold a shared score tile, the general INT8 prompt kernel
+(`prompt_i8.cuh:178`, five barriers, a `p_s` shared probability tile), cannot run on this port at
+all: its arena is `kCausalPromptI8SmemBytes == 93184` (a `static_assert` at `prompt_i8.cuh:122`)
+against Turing's 65,536 B per SM, and `bac38fc8` routed the whole INT8 family away from it onto the
+fast kernel for exactly that reason.
+
+So there is nothing here to fix, and nothing to port: the defect is in a file this port does not
+have, on a tile-selection axis this port does not use. What upstream *also* got from those two
+commits -- "35-68% faster attention on an RTX 2080 Ti" from a four-row tile -- is worth reading as an
+idea for C1's h16 table and the 27B path, but that is a different measurement, not this item.
+
+The branch stays empty of code. It carries this record so a reviewer does not have to re-derive it.
+
 ### D1 — KVMem: clamp a prefill step to the pages that are available · branch `sm75-p14-kvmem`
 
 `planning/startup.cpp:1390` `effective_prefill_chunk()` is `min(options.prefill_chunk,
