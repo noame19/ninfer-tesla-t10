@@ -4,7 +4,6 @@ These rules apply to the whole repository.
 
 **This checkout is the sm_75 (NVIDIA Tesla T10) port of NInfer.** It has its own working rules,
 which sit at the end of this file under [sm_75 port line](#sm_75-port-line-the-tesla-t10-port).
-Read that section and [`docs/remaining-sm75-work.md`](docs/remaining-sm75-work.md) before starting
 work here: the task list, the branch names and the build route all live there, and the sections
 below describe the upstream project rather than this line's pending work.
 
@@ -244,8 +243,11 @@ One artifact is the baseline for every claim on this line:
 Do not measure against anything else unless the task names another model (the 4B/9B artifacts under
 `/mnt/disk238g/ninfer_model/` are for the dense-geometry work).
 
-Current figures and the task list are in
-[`docs/remaining-sm75-work.md`](docs/remaining-sm75-work.md). Reuse those numbers; re-measuring a
+Current figures and the P-numbered task history are in
+[`docs/remaining-sm75-work.md`](docs/remaining-sm75-work.md); the live execution queue, with the
+branch grouping and each item's acceptance condition, is [`docs/todo.md`](docs/todo.md). Work from
+`todo.md`; the P-numbered file is the record of what a task was and what it measured. Reuse those
+numbers; re-measuring a
 figure that is already recorded wastes the card and an iteration.
 
 ### Building: local Docker only
@@ -273,8 +275,9 @@ directory into one build instead of paying twice.
 * **`sm75` is the single main line.** It is the integration point and the source of the one
   `ninfer-serve` that carries every feature.
 * **One task, one branch, named for the task**: `sm75-p4`, `sm75-p5`, `sm75-p0`. `P<n>` is the task
-  identity in `docs/remaining-sm75-work.md` and does not change when priorities are reordered. An
-  experiment that is not a task in that list gets no branch.
+  identity in `docs/remaining-sm75-work.md` and does not change when priorities are reordered. The
+  live queue's branches are `sm75-p10-gdn-routes` onward (see `docs/todo.md`). An
+experiment that is not a task in one of those lists gets no branch.
 * **A branch merges into `sm75` when its own acceptance condition is met *and* quality is
   unchanged.** Speed tasks show measured prefill/tok-s against the recorded figures; capability tasks
   show the artifact starting and running. Numerics-touching changes must show PPL on the same build,
@@ -303,9 +306,49 @@ gate. The rules that were learned the hard way:
   measured at ~12 tok/s at 11.2k (~2.4%), which is larger than several effects being chased.
 * **Record both sides in the commit message** — before and after, on which workload, with the PPL.
 
+
+### Working in parallel
+
+Several items can be in flight at once, and a long compile or a long measurement must not hold the
+session:
+
+* **Anything expected to run past ~10 minutes goes to the background**, with its output in a file,
+  and the session moves to the next item's reading or writing instead of waiting.
+* **A second source tree is how two builds coexist.** `~/work-rom/ninfer-t10-perf` is the tree that
+  builds and measures; a sibling checkout can be made for the next item's development while this one
+  compiles. `build-sm75/` and `.ccache/` are symlinks onto `/mnt/disk238g`, and `.local-build/build.sh`
+  derives its bind mounts from its own location, so a second checkout needs its own copies of those
+  two symlinks (or `NINFER_BUILD_DIR`/`CCACHE_DIR` pointing at separate directories).
+* **Grouping rule.** Two items share a branch when they are the same class of change *and* their
+  effects land on different models or different workloads, so a regression is still attributable by
+  testing one model alone. Sharing a directory is not sufficient reason to share a branch; sharing a
+  build is.
+
 ### Reporting
 
 Report to the user at the end of every stage and stop there; do not run a long unbroken sequence of
 work. Say what was measured, what it means, and what the next step is. Keep the todo list ticked.
 When something fails or regresses, say so in the report with its numbers and not only the part that
 went well.
+
+### What may and may not reach `sm75` (the user's standing rule)
+
+This is not a "merge when convenient" rule; it is the acceptance gate for the whole line.
+
+* **A branch that exists only to be tested is not a merge candidate.** `sm75-p3`, `sm75-p6` and
+  `sm75-p7` are branches whose experiments were run and produced no gain or a small regression; the
+  user's judgement is that the idea may still have room, so they are kept aside rather than merged.
+  Do not merge them into `sm75` "because upstream has the same change" or because the diff is small.
+* **A branch whose experiment is a clear, measured regression gets one commit recording what was
+  tried and its numbers, then the branch is deleted.** The measured-and-rejected history in
+  `docs/sm75-prefill-bottleneck.md` and the P2b entry of the task list is the pattern. A failure is
+  recorded once, not carried as a live branch.
+* **Only a change that is measured to be a real speedup, a real fix, or a real capability, with no
+  compensating cost such as lower answer quality, less stable inference, or a new failure mode,
+  is submitted, and only after the user has agreed to it.** Say what was measured, on which
+  workload, with the PPL side, and get the agreement before the merge. A merge that precedes the
+  user's agreement is a rule violation even when the numbers look good.
+* **Every build goes through the local Docker image at `/home/agent/work-rom/ninfer-build/`.** Do not
+  install a compiler, CUDA toolkit, Python package or any other development component on this host,
+  and do not modify host system files to make a build work. If the container cannot do something,
+  report it instead of widening the host.

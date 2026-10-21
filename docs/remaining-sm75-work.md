@@ -38,6 +38,13 @@ that is most of the way done. **P4** has the cheapest iteration cost of anything
 **P5b shares `causal_cache/` with P4**, so it rides P4's build instead of waiting for its own.
 **P6 goes last among the cheap ones** because `third_party/ggml-quants/src/ggml-cuda/mma.cuh` is
 included by 76 translation units, i.e. 1–2 hours per round — the same wall-clock as P4's whole
+
+> **Status correction (2026-10-21).** This table predates the merge of the Qwen3.5 tower line.
+> P0a, P0b, P0c and P0d are **already on `sm75`** (`4bc9b5ad`, `64c41822`, `6c1a26e5`, merged by
+> `1fd86015`) and the working tree confirms each one; only **P0e (vision)** is still open, and the
+> detail below says why. P5a landed as `66b4bb61` + `054c56ef`, and P4's prompt route landed as
+> `420dabe4` + `bac38fc8`. P3 and P6 remain unmerged test branches by the user's decision, not by
+> omission. The live execution queue is [`todo.md`](todo.md); this file keeps the P-numbered history.
 implementation, for one hoist.
 
 ## Where the port stands
@@ -135,50 +142,63 @@ still 27B-shaped**, in the places below. Positions are on `sm75`.
 
 ### What refuses a load (fix these first, they are validator-only) — **P0a, #4**
 
+**DONE on `sm75` (`4bc9b5ad`).** The three validators are now derived from the tensors rather than
+from the 27B's literals: `src/ops/weight_input.cpp:172-199` uses the structural rule
+`attention ? third == q && fourth == k && q[1] == k[1] : k == q && third == fourth && q[1] == third[1]`,
+`src/ops/weight_input.cpp:262-280` only requires `shape == matrix(b)`, and
+`src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh:42-71` carries
+`Bf16Gdn9Geometry {32,4096}`, `Bf16Gdn4Geometry {32,2560}` and `Bf16Gdn08Geometry {16,1024}`
+next to the 27B's and 35B's. `src/ops/softmax_attention/dense/causal_cache/geometry.cuh:23-25` adds
+`CausalD256H16Kv4` and `CausalD256H8Kv2`, and `src/ops/kernel/mtp_pack.cuh:25-31` takes the four row
+counts as parameters. Verified on the T10: 9B, 4B and 0.8B all start and serve text.
+
 Three local artifacts are already converted and wait for exactly this:
 `/mnt/disk238g/ninfer_model/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M-MTP.ninfer` (2.9 GB),
 `ornith-1.5-9b-uncensored.ninfer` (5.7 GB), `swift-27b-ud-q3_k_xl.ninfer` (12.8 GB). No conversion
 is needed. The 4B fails today with:
 
+For the record, these are the three places that used to refuse a load, and what each one became:
+
 ```
 FATAL server failed during startup | text/layers/0: input projection: unsupported logical projection geometry
 ```
 
-1. `src/ops/weight_input.cpp:169-190` — the fused input projection's geometry whitelist. The two
-   branches it accepts (`dense` 27B, `moe`) are the *same structural rule* with different numbers:
-   attention wants `third == q && fourth == k` (gate shaped like the query, value like the key) and
-   GDN wants `k == q && third == fourth` (key like query, z like value). The literals add no
-   information, so generalizing them merges the branches into one rule.
-2. `src/ops/weight_input.cpp:262-266` — `prepare_gdn_gating_proj_weights` takes `{48,5120}` or
-   `{32,2048}`; a 9B/4B is `{32,4096}`/`{32,2560}`. The rows are the GDN value heads.
-3. `src/ops/wrapper/gdn_input_proj.cpp:1305-1309` — `kGgufHidden 5120`, `kGgufQkvRows 10240`,
-   `kGgufZRows 6144`, `kGgufQueryKey 2048`, `kGgufValue 6144` validate every GGUF GDN projection and
-   the conv composition. All five follow from the tensors the Op is handed (`qkv = 2*key + value`,
-   `value = z`), so they can be derived instead of declared.
+1. ~~`src/ops/weight_input.cpp:169-190` — the fused input projection's geometry whitelist.~~ **Done:**
+   the two branches it accepted (`dense` 27B, `moe`) were the *same structural rule* with different
+   numbers, and the literals added no information, so they merged into one rule in
+   `src/ops/weight_input.cpp:172-199`.
+2. ~~`src/ops/weight_input.cpp:262-266` — `prepare_gdn_gating_proj_weights` takes `{48,5120}` or
+   `{32,2048}`; a 9B/4B is `{32,4096}`/`{32,2560}`.~~ **Done:** `src/ops/weight_input.cpp:262-280`
+   only requires `shape == matrix(b)` and names the mismatch instead.
+3. ~~`src/ops/wrapper/gdn_input_proj.cpp:1305-1309` — `kGgufHidden 5120` and friends.~~ **Done:** the
+   five constants are derived from the tensors the Op is handed (`qkv = 2*key + value`, `value = z`).
 
 ### What has no kernel or route (the real work) — **P0b (#6), P0c (#7), P0d/P0e (#9)**
 
-4. **GDN gating projection** — the largest item. `src/ops/gdn_gating_proj/bf16/` has exactly two
-   instantiations: `Bf16Gdn27Geometry {48,5120,BlockN 128}` and `Bf16Gdn35Geometry {32,2048,BlockN 64}`
-   (`..._gemm_mma.cuh:38-49`), selected by `is_27`/`is_35`
-   (`..._plan.cpp:179-185`) against two closed route tables (`k27Routes`, `k35Routes`) with
-   sm_86 occupancy asserts. A 32-head/4096-hidden or 32-head/2560-hidden tower needs a third
-   geometry struct, the same schedule set instantiated for it, and its own route table. The kernel
-   is templated on the geometry, so this is instantiation plus table work; the route bounds are
-   tuning constants and want the T10's own measurement, not the sm_86 ones.
-5. **Causal attention** — `src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp:51-55`
-   accepts `(query_heads, kv_heads) ∈ {(24,4), (16,2)}` only, against
-   `CausalD256H24Kv4`/`CausalD256H16Kv2` (`geometry.cuh:17-18`). A 9B/4B is `(16,4)`; the
-   `small_t_i8_w*_h16_*` kernels are already instantiated per head count, so this is likely an alias,
-   the whitelist entry and the `SmallTSplitScale` choice — but that scale is a tuning constant, so it
-   needs a measurement rather than a guess.
-6. **MTP** — `src/ops/kernel/mtp_pack.cuh:9-11` hard-codes the 27B's `14336 = 6144+1024+6144+1024`
-   rows for `mtp_split_attn_in_kernel`, so a 4B (10240) or 9B (10240) MTP block would split at the
-   wrong offsets. The four row counts are the block's own attention shapes; pass them in.
-7. **Vision** — the 9B's tower is the 27B's (depth 27, hidden 1152, ffn 4304, 16 heads) except the
-   merger's `projection_dim` 4096 vs 5120, so it may already fit; the 4B's (depth 24, hidden 1024,
-   ffn 4096) and the 0.8B's (depth 12, hidden 768) are new. The vision projections take the official
-   Vision formats, whose plans are shape-literal too, so this needs its own pass.
+Items 4, 5 and 6 are **done** on `sm75`; item 7 is the one still open.
+
+4. ~~**GDN gating projection**~~ **Done (`6c1a26e5`).** `src/ops/gdn_gating_proj/bf16/` now carries
+   `Bf16Gdn9Geometry {32,4096,BlockN 64}`, `Bf16Gdn4Geometry {32,2560,64}` and
+   `Bf16Gdn08Geometry {16,1024,64}` alongside the 27B's and 35B's (`..._gemm_mma.cuh:42-71`). The
+   closed route tables are still what makes a geometry runnable, so a **new** tower still needs a
+   route table and a T10 measurement — the difference is that the four shipped towers no longer do.
+5. ~~**Causal attention**~~ **Done (`64c41822`).** `src/ops/softmax_attention/dense/causal_cache/geometry.cuh:23-25`
+   now defines `CausalD256H24Kv4`, `CausalD256H16Kv4`, `CausalD256H16Kv2` and `CausalD256H8Kv2`, with
+   `kCausalSmallTSplitScale<KVHeadsValue> = 4 / KVHeadsValue`, and `with_causal_geometry` enumerates
+   the four pairs. The *tiers* those geometries launch are still a T10 measurement — that is item C1
+   in [`todo.md`](todo.md), and it is where a naive table already lost 6–9 % on decode.
+6. ~~**MTP**~~ **Done.** `src/ops/kernel/mtp_pack.cuh:25-31` takes `q_rows` and `kv_rows` and computes
+   `attn_rows = 2*q_rows + 2*kv_rows`; the 27B's `14336` is no longer baked in.
+7. **Vision — still open (P0e), and now precisely located.** The 9B's tower is byte-identical to the
+   27B's except the merger's second projection, which is `q8_g32_fp16 [4096,4608]` against the 27B's
+   `[5120,4608]`; `src/ops/linear/q8/q8_dispatch.cpp` has no `4096x4608` entry, so the load throws
+   `q8 linear: unsupported shape` — reproduced on the T10 with `--vision-residency resident`. The 4B
+   and 0.8B towers are genuinely new (`{depth 24, hidden 1024}` and `{depth 12, hidden 768}`): they
+   need new q4/q5/q6/q8 shape entries *and* a `packed_softmax_attention` that admits a 64-wide head,
+   because this tree's op is fixed at `kHeadDim 72` / `kHeads 16`
+   (`packed/packed_softmax_attention.cpp:16-19`). The CPU fallback is 72-wide too
+   (`execution/vision_cpu.cpp:17-23`), which is where the `72-wide heads` notes in the operator's
+   `ninfer.ini` come from. Work items B1–B4 in [`todo.md`](todo.md).
 
 Already general, no work needed: the GGUF linear/vector/MMQ products (`gguf_project` requires only
 `k % 512 == 0`), the GDN recurrent and chunked routes (`head_map::of` derives the head mapping from
