@@ -33,6 +33,11 @@ constexpr std::array kShapes{
     // The 9B towers' vision merger: 2x2 patches of the 1152-wide tower onto a 4096-wide text
     // embedding. No unified table of its own -- it is one projection, run once per image.
     shape<Q8LinearGeometry<4096, 4608>>(select_q8_n4096_k4608),
+    // The 4B and 0.8B mergers.
+    shape<Q8LinearGeometry<4096, 4096>>(select_q8_n4096_k4096),
+    shape<Q8LinearGeometry<2560, 4096>>(select_q8_n2560_k4096),
+    shape<Q8LinearGeometry<3072, 3072>>(select_q8_n3072_k3072),
+    shape<Q8LinearGeometry<1024, 3072>>(select_q8_n1024_k3072),
     shape<Q8N5120K4608>(select_q8_n5120_k4608, select_q8_n5120_k4608_unified),
     shape<Q8N5120K6144>(select_q8_n5120_k6144, select_q8_n5120_k6144_unified),
     shape<Q8N5120K10240>(select_q8_n5120_k10240, select_q8_n5120_k10240_unified),

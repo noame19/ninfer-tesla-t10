@@ -18,4 +18,11 @@ namespace ninfer::ops::detail {
 // embedding, so only the output row count differs.
 [[nodiscard]] Q8Launch select_q8_n4096_k4608(std::int32_t tokens);
 
+// The 4B and 0.8B mergers. The 4B groups 2x2 patches of its 1024-wide tower (4096 wide) onto a
+// 2560-wide text embedding; the 0.8B groups its 768-wide tower (3072 wide) onto a 1024-wide one.
+[[nodiscard]] Q8Launch select_q8_n4096_k4096(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k4096(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n3072_k3072(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n1024_k3072(std::int32_t tokens);
+
 } // namespace ninfer::ops::detail

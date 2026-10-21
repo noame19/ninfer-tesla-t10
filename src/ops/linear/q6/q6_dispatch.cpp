@@ -1,6 +1,7 @@
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/q6/q6_shapes.h"
+#include "ops/linear/q6/q6_shapes_vision.h"
 #include <array>
 #include <stdexcept>
 
@@ -21,6 +22,9 @@ constexpr std::array kShapes{
     ShapeEntry{34816, 5120, select_q6_n34816_k5120},
     ShapeEntry{248320, 2048, select_q6_n248320_k2048, select_q6_n248320_k2048_unified},
     ShapeEntry{1152, 1536, select_q6_n1152_k1536, select_q6_n1152_k1536_unified},
+    // The 4B and 0.8B vision patch embeddings.
+    ShapeEntry{1024, 1536, select_q6_n1024_k1536},
+    ShapeEntry{768, 1536, select_q6_n768_k1536},
 };
 } // namespace
 
