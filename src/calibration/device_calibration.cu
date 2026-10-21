@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -698,11 +699,12 @@ void calibrate_linear_attention(ops::DeviceRouteProfile& profile, Timer& timer,
 
 void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                          const CalibrationOptions& options, KvCacheStorage storage,
-                         const char* coding) {
+                         const char* coding, std::int32_t q_heads, std::int32_t kv_heads) {
     constexpr std::int32_t kLongestEnvelope = 4 * 262144;
     constexpr std::int32_t head_dim = 256;
-    constexpr std::int32_t q_heads  = 24;
-    constexpr std::int32_t kv_heads = 4;
+    // The chunked small-T kernel instantiates widths 1..6 for every geometry and 7..8 for the
+    // 24-head one only, so the sweep stops where the dispatch does (small_t.cu:355-372).
+    const std::int32_t widest_width = q_heads == 24 ? 8 : 6;
     const std::vector<std::int32_t> envelopes = {8192, 65536, 262144};
     const std::int32_t max_window            = envelopes.back();
     const PagedKVStorageLayout layout        = paged_kv_storage_layout(storage, head_dim);
@@ -759,8 +761,11 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
 
-    // FP16-accumulated PV per key tile: one 1024-token prompt chunk at 32K and a decode step at 131K.
-    if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+    // FP16-accumulated PV per key tile: one 1024-token prompt chunk at 32K and a decode step at
+    // 131K. The 24-head geometry only: this switch was fitted against that tower's prompt
+    // shape, and measuring it on a geometry it was not fitted for would record a tier the
+    // other towers never asked for.
+    if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 && q_heads == 24) {
         constexpr std::int32_t chunk = 1024;
         // The fast-kernel comparison runs the chunk the planner aligns to the fast kernel's waves:
         // whole waves of 128-row CTAs are whole waves of the standard kernel's 64-row ones too.
@@ -901,7 +906,7 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
         }
     }
 
-    for (std::int32_t width = 1; width <= 8; ++width) {
+    for (std::int32_t width = 1; width <= widest_width; ++width) {
         const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
             geometry, storage, {1, static_cast<std::uint32_t>(max_window)}, 1, width, width);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
@@ -922,7 +927,8 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                 {1, static_cast<std::uint32_t>(envelope)}, workspace, ot, stream);
         };
         const Family family{
-            "attn_i8_small/h24/" + std::string(coding) + "/w" + std::to_string(width), envelopes,
+            "attn_i8_small/h" + std::to_string(q_heads) + "/" + std::string(coding) + "/w" +
+                std::to_string(width), envelopes,
             [&](std::int32_t envelope, cudaStream_t stream) {
                 attend(envelope, envelope, stream);
                 attend(envelope, std::max(width + 1, envelope / 16), stream);
@@ -959,15 +965,22 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     if (options.groupwise) { calibrate_groupwise(profile, timer, options); }
     if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
     if (options.attention) {
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
-                            "rk8v4");
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedLloyd4KeyInt4Value,
-                            "rk4v4");
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt4KeyInt4ValueE8,
-                            "rk4v4-e8");
-        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedE8RootKeyInt4Value,
-                            "rk2v4-e8");
-        calibrate_attention(profile, timer, options, KvCacheStorage::Int8Group64, "int8");
+        // The three query geometries `with_causal_geometry` admits and this catalog can name; see
+        // the note in route_catalog.cpp for why (16,2) is absent.
+        for (const auto& [q_heads, kv_heads] :
+             std::array<std::pair<std::int32_t, std::int32_t>, 3>{{{24, 4}, {16, 4}, {8, 2}}}) {
+            calibrate_attention(profile, timer, options,
+                                KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, "rk8v4", q_heads,
+                                kv_heads);
+            calibrate_attention(profile, timer, options, KvCacheStorage::RotatedLloyd4KeyInt4Value,
+                                "rk4v4", q_heads, kv_heads);
+            calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt4KeyInt4ValueE8,
+                                "rk4v4-e8", q_heads, kv_heads);
+            calibrate_attention(profile, timer, options, KvCacheStorage::RotatedE8RootKeyInt4Value,
+                                "rk2v4-e8", q_heads, kv_heads);
+            calibrate_attention(profile, timer, options, KvCacheStorage::Int8Group64, "int8",
+                                q_heads, kv_heads);
+        }
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

@@ -1,6 +1,7 @@
 #include "calibration/route_catalog.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -66,25 +67,38 @@ std::vector<RouteCatalogEntry> build_catalog() {
     // Parallel query tiles for single-row chunked small-T widths, measured on rk8v4.
     add("attn_parallel_tiles", {"on"});
 
-    // Small-T attention launch tiers for 24 query heads over 4 KV heads, per KV coding and query
-    // width: the tier list depends on how many 16-row tiles the width's query rows fill.
-    constexpr int query_heads_per_kv_head = 24 / 4;
-    for (const char* coding : {"rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "int8"}) {
-        for (int width = 1; width <= 8; ++width) {
-            const int row_tiles = (width * query_heads_per_kv_head + 15) / 16;
-            std::vector<std::string> tiers;
-            if (row_tiles == 1) {
-                tiers = {"2x4x32",  "4x2x32",  "8x2x32",  "16x1x32",  "2x2x32q",
-                         "4x2x32q", "4x2x32e", "8x2x32e", "16x1x32e", "4x2x32qe"};
-            } else if (row_tiles == 2) {
-                tiers = {"4x2x32",  "8x2x32",  "16x1x32",  "32x1x32",  "4x2x32q",  "8x2x32q",
-                         "4x2x32e", "8x2x32e", "16x1x32e", "4x2x32qe", "8x2x32qe"};
-            } else {
-                tiers = {"6x2x32",   "12x1x32", "12x1x64d", "24x1x32",  "6x2x32q",
-                         "12x1x32q", "6x2x32e", "12x1x32e", "6x2x32qe", "12x1x32qe"};
+    // Small-T attention launch tiers per query geometry, KV coding and query width. The tier list
+    // depends on how many 16-row tiles the width's query rows fill, which is
+    // (width * QHeads / KVHeads + 15) / 16 -- so it differs per geometry and the key has to name
+    // the geometry. Three of the four pairs `with_causal_geometry` admits are spelled here:
+    // (24,4) for the 27B, (16,4) for the 9B and 4B, (8,2) for the 0.8B. (16,2) is left out on
+    // purpose: small_t_i8_route_key names a geometry by its *query* head count alone, so (16,2)
+    // and (16,4) would write the same key while needing different row-tile counts -- a tower of
+    // that shape would need the key format widened first, and no shipped tower has it.
+    constexpr std::array<std::pair<int, int>, 3> kAttentionGeometries{{{24, 4}, {16, 4}, {8, 2}}};
+    for (const auto& [q_heads, kv_heads] : kAttentionGeometries) {
+        const int query_heads_per_kv_head = q_heads / kv_heads;
+        // The chunked small-T kernel instantiates widths 1..6 for every geometry and 7..8 for the
+        // 24-head one only (`small_t.cu:355-372`), so those are the widths a tier can be measured at.
+        const int widest = q_heads == 24 ? 8 : 6;
+        for (const char* coding : {"rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "int8"}) {
+            for (int width = 1; width <= widest; ++width) {
+                const int row_tiles = (width * query_heads_per_kv_head + 15) / 16;
+                std::vector<std::string> tiers;
+                if (row_tiles == 1) {
+                    tiers = {"2x4x32",  "4x2x32",  "8x2x32",  "16x1x32",  "2x2x32q",
+                             "4x2x32q", "4x2x32e", "8x2x32e", "16x1x32e", "4x2x32qe"};
+                } else if (row_tiles == 2) {
+                    tiers = {"4x2x32",  "8x2x32",  "16x1x32",  "32x1x32",  "4x2x32q",  "8x2x32q",
+                             "4x2x32e", "8x2x32e", "16x1x32e", "4x2x32qe", "8x2x32qe"};
+                } else {
+                    tiers = {"6x2x32",   "12x1x32", "12x1x64d", "24x1x32",  "6x2x32q",
+                             "12x1x32q", "6x2x32e", "12x1x32e", "6x2x32qe", "12x1x32qe"};
+                }
+                add("attn_i8_small/h" + std::to_string(q_heads) + "/" + coding + "/w" +
+                        std::to_string(width),
+                    std::move(tiers));
             }
-            add(std::string("attn_i8_small/h24/") + coding + "/w" + std::to_string(width),
-                std::move(tiers));
         }
     }
 
