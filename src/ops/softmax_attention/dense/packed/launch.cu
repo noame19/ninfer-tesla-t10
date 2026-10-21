@@ -13,16 +13,16 @@ std::int64_t stride_elements(const Tensor& tensor, int dim) {
     return tensor.nb[dim] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 }
 
-template <int Br, int Bc>
+template <int Br, int Bc, int HeadDim = kPackedAttentionHeadDim,
+          int Heads = kPackedAttentionHeads>
 void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
                   const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
                   std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
     constexpr int kThreads = Br * 2;
     constexpr int kSmemBytes =
         (Br + 2 * Bc) * kPackedAttentionPaddedD * static_cast<int>(sizeof(__nv_bfloat16));
-    const dim3 grid(static_cast<unsigned>(query_tiles),
-                    static_cast<unsigned>(kPackedAttentionHeads), 1u);
-    packed_attention_flash_kernel<Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
+    const dim3 grid(static_cast<unsigned>(query_tiles), static_cast<unsigned>(Heads), 1u);
+    packed_attention_flash_kernel<Br, Bc, HeadDim, Heads><<<grid, kThreads, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
         static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
@@ -36,6 +36,8 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
 void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
                              cudaStream_t stream) {
+    const std::int32_t head_dim = q.ne[0];
+    const std::int32_t heads    = q.ne[1];
     const bool packed_segments = tiles != nullptr;
     const int max_tiles =
         packed_segments ? tiles->ne[1] : (q.ne[2] + kPackedAttentionBr - 1) / kPackedAttentionBr;
@@ -46,9 +48,23 @@ void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
         CUDA_CHECK(cudaGetLastError());
     }
 
-    launch_flash<kPackedAttentionBr, kPackedAttentionBc>(
-        q, k, v, packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr,
-        0, max_tiles, out, stream);
+    const auto* tile_data =
+        packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr;
+    if (head_dim == kPackedAttentionVisionHeadDim) {
+        // The 4B (16 heads) and 0.8B (12 heads) vision towers.
+        if (heads == 16) {
+            launch_flash<kPackedAttentionBr, kPackedAttentionBc, 64, 16>(q, k, v, tile_data, 0,
+                                                                        max_tiles, out, stream);
+            return;
+        }
+        if (heads == 12) {
+            launch_flash<kPackedAttentionBr, kPackedAttentionBc, 64, 12>(q, k, v, tile_data, 0,
+                                                                        max_tiles, out, stream);
+            return;
+        }
+    }
+    launch_flash<kPackedAttentionBr, kPackedAttentionBc>(q, k, v, tile_data, 0, max_tiles, out,
+                                                        stream);
 }
 
 std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
@@ -75,17 +91,33 @@ std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
 void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k, const Tensor& v,
                                                std::int32_t segment_length, std::int32_t tile_size,
                                                Tensor& out, cudaStream_t stream) {
+    const std::int32_t head_dim    = q.ne[0];
+    const std::int32_t heads       = q.ne[1];
     const std::int32_t segments    = q.ne[2] / segment_length;
     const std::int32_t query_tiles = segments * ((segment_length + tile_size - 1) / tile_size);
+    const bool narrow_head         = head_dim == kPackedAttentionVisionHeadDim;
+    const auto dispatch = [&]<int Tile, int HeadDim, int Heads>() {
+        launch_flash<Tile, Tile, HeadDim, Heads>(q, k, v, nullptr, segment_length, query_tiles, out,
+                                                stream);
+    };
+    const auto per_tile = [&]<int Tile>() {
+        if (narrow_head && heads == 16) {
+            dispatch.template operator()<Tile, 64, 16>();
+        } else if (narrow_head && heads == 12) {
+            dispatch.template operator()<Tile, 64, 12>();
+        } else {
+            dispatch.template operator()<Tile, kPackedAttentionHeadDim, kPackedAttentionHeads>();
+        }
+    };
     switch (tile_size) {
     case 16:
-        launch_flash<16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        per_tile.template operator()<16>();
         return;
     case 32:
-        launch_flash<32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        per_tile.template operator()<32>();
         return;
     case 64:
-        launch_flash<64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        per_tile.template operator()<64>();
         return;
     default:
         throw std::invalid_argument("packed_softmax_attention: invalid uniform tile size");

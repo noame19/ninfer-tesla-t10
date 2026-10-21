@@ -13,17 +13,28 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 72;
-constexpr std::int32_t kHeads   = 16;
-constexpr float kExpectedScale  = 0.11785113019775792073f;
+// The vision towers this op serves: the 1152-wide one (72-wide heads, 16 of them) on the 27B and
+// the three 9B models, and the narrower 64-wide ones on the 4B (16 heads) and 0.8B (12 heads).
+struct PackedProfile {
+    std::int32_t head_dim;
+    std::int32_t heads;
+};
+constexpr PackedProfile kProfiles[] = {{72, 16}, {64, 16}, {64, 12}};
 
 void require_profile(AttentionHeadGeometry geometry, float scale, const char* op) {
-    if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
-        geometry.query_heads != kHeads || geometry.kv_heads != kHeads) {
+    if (!valid_attention_head_geometry(geometry) || geometry.query_heads != geometry.kv_heads) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-7f) {
-        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(72)");
+    const bool known = std::any_of(std::begin(kProfiles), std::end(kProfiles),
+                                   [&](const PackedProfile& p) {
+                                       return p.head_dim == geometry.head_dim &&
+                                              p.heads == geometry.query_heads;
+                                   });
+    if (!known) { throw std::invalid_argument(std::string(op) + ": unsupported head geometry"); }
+    // The op is always used with the tower's own 1/sqrt(head_dim).
+    const double expected = 1.0 / std::sqrt(static_cast<double>(geometry.head_dim));
+    if (!std::isfinite(scale) || std::abs(static_cast<double>(scale) - expected) > 1.0e-7) {
+        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(head_dim)");
     }
 }
 
@@ -44,14 +55,15 @@ Tensor allocate_workspace(Allocator& allocator, std::int32_t tokens, std::int32_
     return tiles == 0 ? Tensor{} : allocator.alloc(DType::I32, {4, tiles});
 }
 
-void require_qkv(const Tensor& tensor, std::int32_t tokens, const char* op, const char* name) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHeadDim || tensor.ne[1] != kHeads ||
+void require_qkv(const Tensor& tensor, std::int32_t tokens, std::int32_t head_dim,
+                 std::int32_t heads, const char* op, const char* name) {
+    if (tensor.dtype != DType::BF16 || tensor.ne[0] != head_dim || tensor.ne[1] != heads ||
         tensor.ne[2] != tokens || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string(op) + ": invalid " + name + " shape");
     }
     constexpr std::int64_t elem = 2;
-    if (tensor.nb[0] != elem || tensor.nb[1] != elem * kHeadDim ||
-        tensor.nb[2] < elem * kHeadDim * kHeads || (tensor.nb[2] % elem) != 0) {
+    if (tensor.nb[0] != elem || tensor.nb[1] != elem * head_dim ||
+        tensor.nb[2] < elem * head_dim * heads || (tensor.nb[2] % elem) != 0) {
         throw std::invalid_argument(std::string(op) + ": invalid " + name + " strides");
     }
     if (tensor.data == nullptr) {
@@ -64,10 +76,10 @@ std::int32_t validate_qkv(const Tensor& q, const Tensor& k, const Tensor& v, con
     require_profile(geometry, scale, op);
     const std::int32_t tokens = q.ne[2];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
-    require_qkv(q, tokens, op, "q");
-    require_qkv(k, tokens, op, "k");
-    require_qkv(v, tokens, op, "v");
-    require_qkv(out, tokens, op, "out");
+    require_qkv(q, tokens, geometry.head_dim, geometry.query_heads, op, "q");
+    require_qkv(k, tokens, geometry.head_dim, geometry.kv_heads, op, "k");
+    require_qkv(v, tokens, geometry.head_dim, geometry.kv_heads, op, "v");
+    require_qkv(out, tokens, geometry.head_dim, geometry.query_heads, op, "out");
     if (!out.is_contiguous()) {
         throw std::invalid_argument(std::string(op) + ": out must be contiguous");
     }
@@ -81,7 +93,9 @@ std::size_t packed_softmax_attention_workspace_capacity_bytes(AttentionHeadGeome
                                                               std::int32_t max_tokens,
                                                               std::int32_t min_segments,
                                                               std::int32_t max_segments) {
-    require_profile(geometry, kExpectedScale, "packed_softmax_attention workspace");
+    // The workspace size does not depend on the scale; the geometry check is what matters here.
+    require_profile(geometry, static_cast<float>(1.0 / std::sqrt(static_cast<double>(geometry.head_dim))),
+                    "packed_softmax_attention workspace");
     if (min_tokens <= 0 || max_tokens < min_tokens || min_segments <= 0 ||
         max_segments < min_segments || min_segments > max_tokens) {
         throw std::invalid_argument(
