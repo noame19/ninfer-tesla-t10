@@ -323,10 +323,6 @@ A long compile or a long measurement must not hold the session:
 * **Never fast-forward a branch into `sm75` to "keep it current".** A branch reaches `sm75` only
   through the merge rule above, with the operator's agreement. `git merge`/`git pull` between a task
   branch and `sm75` in either direction is that merge.
-* **Grouping rule.** Two items share a branch when they are the same class of change *and* their
-  effects land on different models or different workloads, so a regression is still attributable by
-  testing one model alone. Sharing a directory is not sufficient reason to share a branch; sharing a
-  build is.
 
 ### Reporting
 
@@ -356,3 +352,10 @@ This is not a "merge when convenient" rule; it is the acceptance gate for the wh
   install a compiler, CUDA toolkit, Python package or any other development component on this host,
   and do not modify host system files to make a build work. If the container cannot do something,
   report it instead of widening the host.
+* **Batch the compiles, not the branches.** A long build is the expensive resource here, so items
+  that share a build should share a branch — provided their effects stay separable. Two items may
+  share a branch when they are the same class of change *and* their effects land on different
+  models or different workloads, so a regression is still attributable by testing one model alone.
+  If batching them would make the next measurement unable to say which change caused a difference,
+  they go on separate branches and pay two builds. Sharing a directory is not sufficient reason to
+  share a branch; sharing a build is.
