@@ -630,6 +630,45 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),
                    product::format_pretty_text(context_cost.hardware_class),
                    product::format_pretty_text(context_cost.prefill_signature));
+
+    // Speculation is the one setting this report cannot otherwise convey: a run with a drafter and
+    // a run without one print identical startup lines and differ by a factor of two in decode, so a
+    // measurement quoted without it cannot be compared against another. Print what was resolved,
+    // including the copy drafter that rides along, and say plainly when nothing is drafting.
+    const ninfer::SpeculativeOptions& spec = engine.speculative;
+    if (spec.backend == ninfer::SpeculativeBackend::None) {
+        logger_->info("[spec] backend=none draft_tokens=0 ngram={} mtp_attention_window={}",
+                      product::format_pretty_count(spec.ngram_draft_tokens),
+                      product::format_pretty_count(spec.mtp_attention_window));
+    } else {
+        logger_->info("[spec] backend={} draft_tokens={} policy={} ngram={} "
+                      "mtp_attention_window={}",
+                      product::speculative_backend_name(spec.backend),
+                      product::format_pretty_count(spec.draft_tokens),
+                      spec.mtp_policy == ninfer::MtpDraftPolicy::Adaptive ? "adaptive" : "fixed",
+                      product::format_pretty_count(spec.ngram_draft_tokens),
+                      product::format_pretty_count(spec.mtp_attention_window));
+    }
+
+    // KVMem's budget, and the two relations a measurement depends on. Neither is an error when it
+    // holds differently -- KVMem serves a prompt longer than the pool by keeping most of the history
+    // on the host and scoring it back in (verified: a 147k-token needle prompt answered at every
+    // position against a 51k-token pool) -- but both determine what the run can be, so print them.
+    if (engine.kvmem.selected_tokens != 0) {
+        const ninfer::KvmemOptions& kvmem = engine.kvmem;
+        const std::uint64_t window        = kvmem.device_tokens();
+        logger_->info("[kvmem] selected={} reserve={} window={} | pool {} tokens over {} pages | "
+                      "host {} | sessions {} | prefill chunk {} | chunk {} the reserve",
+                      product::format_pretty_count(kvmem.selected_tokens),
+                      product::format_pretty_count(kvmem.reserve_tokens),
+                      product::format_pretty_count(window),
+                      product::format_pretty_count(memory.kv_capacity),
+                      product::format_pretty_count(memory.kv_capacity_page_groups),
+                      product::format_pretty_bytes(kvmem.host_bytes),
+                      product::format_pretty_count(kvmem.retained_sessions),
+                      product::format_pretty_count(engine.prefill_chunk),
+                      engine.prefill_chunk <= kvmem.reserve_tokens ? "fits" : "EXCEEDS");
+    }
 }
 
 void OperationalLog::warmup_started() const { logger_->debug("warming up"); }
