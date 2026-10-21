@@ -218,6 +218,31 @@ small pool cannot ask for more pages than exist — the failure mode it removes 
 Acceptance: a pool smaller than the prefill chunk serves the request instead of refusing it; the
 chunk actually used is logged; T10 prefill speed on the acceptance artifact unchanged.
 
+**Result: the premise does not hold here, and the failure mode it describes does not exist in this
+tree.** Upstream's clamp removes a 429 at admission, `this step needs N free, M available`. That
+message is not in this tree: `grep -rn "this step needs" src/` finds nothing, and the only admission
+refusal is `context cache exhausted: an idle Engine found no placement`
+(`src/runtime/engine/engine_core.h:2505`), which fires when no active lane can release anything --
+a different condition, and not one a prefill clamp would change.
+
+What this tree does instead was measured rather than assumed. With a 51,200-token window (budget
+20,480 + gen-reserve 30,720, `--prefill-chunk 1024`) on the acceptance artifact:
+
+- A single 147,447-token prompt answered correctly with a needle at 10%, 25%, 50%, 75% and 90% of
+  its length -- all five found, 367 s each. So a prompt three times the pool is served in full.
+- A three-turn conversation whose history reached 168,080 tokens: turn 1 planted the needle at 40%
+  of an over-pool prompt (417 s); turns 2 and 3 recalled it exactly (168,110 and 168,141 tokens of
+  history, 3.6 s and 3.1 s). So the history survives eviction and restore, not just the live window.
+
+That is the opposite of upstream's documented behaviour, where a prompt longer than the pool loses
+its middle silently. Their engine and this one differ in more than the clamp: they run the ring with
+`--max-shared-prefixes 0` and four protected buckets, this tree runs a retrieval-based window that
+keeps the history in host memory.
+
+So there is no clamp to add. What was worth adding instead is the observability that would have made
+this question answerable from a log rather than by benchmark -- the `[kvmem]` startup line in D3,
+which prints the window, the pool, the host budget and the prefill chunk against the reserve.
+
 ### D2 — KVMem: the startup line that says what speculation is doing · branch `sm75-p14-kvmem`
 
 `[spec] backend=… draft_tokens=… adaptive=… attention_window=… ngram=…`, printed once at startup,
@@ -289,6 +314,41 @@ switching A → B → A works; host memory returns after an unload (RSS back to 
 reports `kvmem` for the KVMem model only.
 
 ### E3 — The unload path with KVMem attached · branch `sm75-p13-router-kvmem` (measurement)
+
+**Measured while verifying E4**, which is the only way this could be measured: two 27B/9B KVMem
+models behind one router on a 16 GiB card do not fit together, so every request crosses the eviction
+path.
+
+**The coexistence question, answered by three configurations rather than one.** What matters to an
+operator is not whether KVMem and the router can be made to start together, but whether two models
+stay resident:
+
+| second model | both load-on-startup | `models-max 2` | result |
+|---|---|---|---|
+| 9B KVMem + 0.8B ordinary | yes | 2 | **both resident**, alternating requests answer in 0.53/0.79 s then 0.30/0.07 s |
+| 9B KVMem + 0.8B KVMem | yes | 2 | **both resident**, same pattern (0.59/0.48 s then 0.26/0.08 s) |
+| 27B KVMem + 9B KVMem | yes | 2 | does not fit in 16 GiB; each request evicts and reloads the other |
+
+So KVMem does not force serial residency, and it is not the KVMem that fills the card -- 16 GiB holds
+a 9B plus a 0.8B with KVMem on both. The rule is the ordinary one: `models-max 2` keeps two models
+resident whenever the card can hold them, and evicts by unload (never sleep, because a KVMem Engine
+cannot be suspended) only when it cannot.
+
+    21:13:40  capacity | q8mtp   loaded        runtime 1.99 GiB | free 1.32 GiB
+    21:14:04  capacity | ornith15 loaded       runtime 1.46 GiB | free 7.13 GiB    (q8mtp unloaded)
+    21:14:47  capacity | q8mtp   reloaded      runtime 1.99 GiB | free 1.32 GiB    (ornith15 unloaded)
+
+    request 1  q8mtp      43.1 s
+    request 2  ornith15   25.5 s
+    request 3  q8mtp      44.6 s
+
+Each request pays a full weight load, because a KVMem model cannot be suspended -- `model_instance`
+refuses `--model-suspend` with KVMem, so the registry's `suspendable()` answers no and it takes the
+unload path. The numbers are the load times of these two artifacts, not a KVMem penalty: the host
+payload budget is released with the Engine and re-pinned on load, and nothing is left behind. The
+knob that decides how often this is paid is `--unload-idle-seconds`; a router with two KVMem models
+and no eviction headroom is a serial reload loop, and should set it high enough that a conversation
+does not cross it.
 
 Not a code change: a probe that loads a KVMem model, forces eviction by requesting another model,
 then requests the first again, watching RSS, VRAM and the KVMem counters. What is being falsified is

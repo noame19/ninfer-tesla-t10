@@ -1645,9 +1645,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--default-graft '" + options.default_graft +
                                     "' does not name a --graft");
     }
+    if (options.kvmem.selected_tokens != 0 && options.router()) {
+        // In router mode the command line is appended to every model's arguments, so a KVMem option
+        // here does not configure "the router" -- it configures every model, including the ones
+        // whose preset never asked for KVMem, and those refuse to load. Point at the fix rather
+        // than at the precondition list that would fire twenty lines later.
+        throw std::invalid_argument(
+            "a --kvmem- option on the command line would be applied to every model in the router, "
+            "and a model whose preset section does not ask for KVMem refuses to start when one "
+            "reaches it. Write the KVMem options under that model's own [id] section of the "
+            "--models-preset file instead.");
+    }
     if (options.kvmem.selected_tokens != 0 &&
-        (options.suspend.enabled || !options.grafts.empty() || options.router())) {
-        throw std::invalid_argument("KVMem does not support model suspend, prompt grafts or model router mode");
+        (options.suspend.enabled || !options.grafts.empty())) {
+        throw std::invalid_argument("KVMem does not support model suspend or prompt grafts");
     }
     // Resolve policy-implied cache mode before choosing the KV default or validating cache flags.
     if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {

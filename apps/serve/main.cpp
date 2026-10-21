@@ -349,9 +349,22 @@ int main(int argc, char** argv) {
         // One model's service: its Engine loaded and warmed up. Single-model mode builds it before
         // the registry exists, to learn the model's public id; router mode builds each on demand.
         const auto make_service = [&](const ninfer::serve::ServeOptions& model_options) {
-            if (options.router() && model_options.kvmem.selected_tokens != 0) {
-                throw std::invalid_argument("KVMem is not supported in model router mode");
-            }
+            // KVMem and the router are two ways of holding more than one conversation's worth of
+            // state, and they were refused together because neither was audited against the other.
+            // What held the refusal in place was not KVMem's per-Engine state -- that is exactly as
+            // private as the model it belongs to -- but the lifecycle the router drives:
+            // `--model-suspend` cannot be combined with KVMem at all (a suspended Engine drops the
+            // device pool KVMem addresses, and `model_instance.cpp` refuses the pairing), so a
+            // KVMem model must be evicted by unload and never by sleep. The registry already asks
+            // `suspendable()` before sleeping a model and unloads the ones that answer no, so a
+            // KVMem model takes the unload path with no further change. Its cost is a full reload
+            // on the next request instead of a wake, which is why the preset for such a model
+            // should set `unload-idle-seconds` (a router-level flag) deliberately rather than
+            // leave it at zero and keep every model resident.
+            //
+            // The option set that reaches this point has already been through the same KVMem
+            // validator a single-model server runs, so a KVMem model that gets here is a KVMem
+            // model that would have started on its own.
             auto service = std::make_unique<ninfer::serve::GenerationService>(
                 model_options, startup_log.observer(),
                 ninfer::product::engine_diagnostic_observer(logger),
@@ -433,7 +446,9 @@ int main(int argc, char** argv) {
                 .models_max  = options.models_max,
                 .autoload    = options.models_autoload,
                 .sleep_idle  = std::chrono::seconds(options.sleep_idle_seconds),
-                .unload_idle = std::chrono::seconds(options.unload_idle_seconds)},
+                .unload_idle = std::chrono::seconds(options.unload_idle_seconds),
+                // Only router mode has more than one model to weigh against the card.
+                .enforce_device_room = options.router()},
             [&](const ninfer::serve::ModelDefinition& definition)
                 -> std::unique_ptr<ninfer::serve::ModelService> {
                 if (first) {
