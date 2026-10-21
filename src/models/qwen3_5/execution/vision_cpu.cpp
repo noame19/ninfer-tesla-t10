@@ -14,18 +14,31 @@ namespace ninfer::models::qwen3_5::execution {
 namespace {
 
 constexpr float kNormEpsilon = 1.0e-6F;
-// The two-axis rotary geometry of the Qwen3.5 tower: 72-wide heads rotate 36 pairs, the first 18
-// by the patch row and the rest by its column, at 10000^(-2i/36) for i = pair % 18 -- the device
-// kernel's constant table (ops/kernel/rope.cuh), so both encoders rotate by the same angles.
-constexpr std::int32_t kHeadDim                   = 72;
-constexpr std::int32_t kAxisPairs                 = 18;
-constexpr std::int32_t kRotaryPairs               = 2 * kAxisPairs;
-constexpr float kRopeInverseFrequency[kAxisPairs] = {
-    1.000000000e+00F, 5.994842503e-01F, 3.593813664e-01F, 2.154434690e-01F, 1.291549665e-01F,
-    7.742636827e-02F, 4.641588834e-02F, 2.782559402e-02F, 1.668100537e-02F, 1.000000000e-02F,
-    5.994842503e-03F, 3.593813664e-03F, 2.154434690e-03F, 1.291549665e-03F, 7.742636827e-04F,
-    4.641588834e-04F, 2.782559402e-04F, 1.668100537e-04F,
+
+// The two-axis rotary geometry of a vision tower. A head is split into two axes of HeadDim/2
+// dimensions, so each axis rotates HeadDim/4 pairs at 10000^(-2i/(HeadDim/2)); the first axis is
+// the patch row, the second its column. The 1152-wide tower (27B, 9B) is 72 wide and gives the
+// 18-value table this encoder shipped with, which ops/kernel/rope.cuh reproduces for the device;
+// the 1024- and 768-wide towers are 64 wide and give 16 values.
+struct VisionRotary {
+    std::int32_t head_dim      = 72;
+    std::int32_t axis_pairs    = 18;
+    std::int32_t rotary_pairs  = 36;
+    std::vector<float> inverse_frequency;
 };
+
+VisionRotary vision_rotary(std::int32_t head_dim) {
+    VisionRotary out;
+    out.head_dim     = head_dim;
+    out.axis_pairs   = head_dim / 4;
+    out.rotary_pairs = head_dim / 2;
+    out.inverse_frequency.reserve(static_cast<std::size_t>(out.axis_pairs));
+    const double half = static_cast<double>(head_dim) / 2.0;
+    for (std::int32_t i = 0; i < out.axis_pairs; ++i) {
+        out.inverse_frequency.push_back(static_cast<float>(std::pow(10'000.0, -2.0 * i / half)));
+    }
+    return out;
+}
 
 float bf16_to_f32(std::uint16_t word) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16U);
@@ -281,16 +294,17 @@ void gelu_exact(Matrix& x, Team& team) {
     });
 }
 
-// Rotates the query and key rows of every head in place: element i of a head pairs with i + 36,
-// by the patch row for i < 18 and by its column otherwise.
-void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads,
+// Rotates the query and key rows of every head in place: element i of a head pairs with
+// i + rotary_pairs, by the patch row for the first axis's pairs and by its column for the rest.
+void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads, const VisionRotary& rotary,
           const std::vector<std::int32_t>& ids, Team& team) {
     const std::int32_t tokens = qkv.cols;
-    std::vector<float> cosine(static_cast<std::size_t>(kRotaryPairs) * tokens);
+    std::vector<float> cosine(static_cast<std::size_t>(rotary.rotary_pairs) * tokens);
     std::vector<float> sine(cosine.size());
-    for (std::int32_t pair = 0; pair < kRotaryPairs; ++pair) {
-        const std::int32_t axis = pair / kAxisPairs;
-        const float frequency   = kRopeInverseFrequency[pair % kAxisPairs];
+    for (std::int32_t pair = 0; pair < rotary.rotary_pairs; ++pair) {
+        const std::int32_t axis = pair / rotary.axis_pairs;
+        const float frequency   = rotary.inverse_frequency[static_cast<std::size_t>(
+            pair % rotary.axis_pairs)];
         for (std::int32_t t = 0; t < tokens; ++t) {
             const float angle =
                 static_cast<float>(ids[static_cast<std::size_t>(axis) * tokens + t]) * frequency;
@@ -302,10 +316,11 @@ void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads,
     team.run(static_cast<std::size_t>(2 * heads), 1, [&](std::size_t begin, std::size_t end) {
         for (auto head = static_cast<std::int32_t>(begin); head < static_cast<std::int32_t>(end);
              ++head) {
-            const std::int32_t base = (head / heads) * hidden + (head % heads) * kHeadDim;
-            for (std::int32_t pair = 0; pair < kRotaryPairs; ++pair) {
+            const std::int32_t base =
+                (head / heads) * hidden + (head % heads) * rotary.head_dim;
+            for (std::int32_t pair = 0; pair < rotary.rotary_pairs; ++pair) {
                 float* first         = qkv.row(base + pair);
-                float* second        = qkv.row(base + pair + kRotaryPairs);
+                float* second        = qkv.row(base + pair + rotary.rotary_pairs);
                 const float* cosines = cosine.data() + static_cast<std::size_t>(pair) * tokens;
                 const float* sines   = sine.data() + static_cast<std::size_t>(pair) * tokens;
                 for (std::int32_t t = 0; t < tokens; ++t) {
@@ -323,12 +338,13 @@ void rope(Matrix& qkv, std::int32_t hidden, std::int32_t heads,
 // frame group or one image), per head, over the packed query/key/value rows of `qkv`. Both passes
 // walk the keys in blocks so a query block's scores stay in the first-level cache.
 void segment_attention(const Matrix& qkv, std::int32_t hidden, std::int32_t heads,
-                       std::int32_t segment, Matrix& out, Team& team) {
+                       const VisionRotary& rotary, std::int32_t segment, Matrix& out, Team& team) {
     constexpr std::int32_t kQueries = 32;
     constexpr std::int32_t kKeys    = 256;
     const std::int32_t tokens       = qkv.cols;
     const std::int32_t segments     = tokens / segment;
     const std::int32_t blocks       = (segment + kQueries - 1) / kQueries;
+    const std::int32_t kHeadDim = rotary.head_dim;
     const float scale       = static_cast<float>(1.0 / std::sqrt(static_cast<double>(kHeadDim)));
     const std::size_t tasks = static_cast<std::size_t>(heads) * segments * blocks;
     team.run(tasks, 1, [&](std::size_t begin, std::size_t end) {
@@ -418,6 +434,10 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
     const auto merged  = static_cast<std::int32_t>(control.merged_count);
     const auto hidden  = weights.hidden;
     const auto segment = control.segment_length;
+    if (hidden <= 0 || weights.heads <= 0 || hidden % weights.heads != 0) {
+        throw std::invalid_argument("CPU Vision: hidden size must divide by the head count");
+    }
+    const VisionRotary rotary = vision_rotary(hidden / weights.heads);
     if (count <= 0 || merged <= 0 || count != merged * weights.merge_unit || segment <= 0 ||
         count % segment != 0 ||
         patches.size() != static_cast<std::size_t>(count) * weights.patch_width ||
@@ -469,8 +489,8 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
         if (stop()) { return {}; }
         layer_norm(x, layer.norm1_weight, layer.norm1_bias, normed, team);
         linear(layer.qkv, layer.qkv_bias, 3 * hidden, normed, qkv, team);
-        rope(qkv, hidden, weights.heads, control.position_ids, team);
-        segment_attention(qkv, hidden, weights.heads, segment, attended, team);
+        rope(qkv, hidden, weights.heads, rotary, control.position_ids, team);
+        segment_attention(qkv, hidden, weights.heads, rotary, segment, attended, team);
         linear(layer.output, layer.output_bias, hidden, attended, projected, team);
         add_into(x, projected, team);
         layer_norm(x, layer.norm2_weight, layer.norm2_bias, normed, team);

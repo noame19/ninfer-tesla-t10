@@ -1,5 +1,6 @@
 #include "models/qwen3_5/load/vision_cpu.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -11,7 +12,9 @@
 namespace ninfer::models::qwen3_5 {
 namespace {
 
-constexpr std::int32_t kRotaryHeadDim = 72;
+// The two head widths the 2-D rotary geometry is built for: 1152/16 = 72 on the 27B and 9B,
+// 1024/16 = 768/12 = 64 on the 4B and 0.8B. Anything else has no measured frequency table.
+constexpr std::int32_t kRotaryHeadDims[] = {72, 64};
 
 float bf16_to_f32(std::uint16_t word) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16U);
@@ -140,11 +143,13 @@ std::size_t CpuVisionWeights::bytes() const noexcept {
 }
 
 void CpuVisionWeights::validate() const {
-    if (hidden <= 0 || heads <= 0 || hidden % heads != 0 || head_dim() != kRotaryHeadDim ||
+    if (hidden <= 0 || heads <= 0 || hidden % heads != 0 ||
+        std::find(std::begin(kRotaryHeadDims), std::end(kRotaryHeadDims), head_dim()) ==
+            std::end(kRotaryHeadDims) ||
         intermediate <= 0 || patch_width <= 0 || merge_unit <= 0 || output_hidden <= 0 ||
         position_rows <= 0 || layers.empty()) {
         throw std::invalid_argument(
-            "CPU Vision needs the two-axis rotary tower geometry (72-wide heads)");
+            "CPU Vision needs the two-axis rotary tower geometry (72- or 64-wide heads)");
     }
     const auto h = static_cast<std::size_t>(hidden);
     const auto i = static_cast<std::size_t>(intermediate);
