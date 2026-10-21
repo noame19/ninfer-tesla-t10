@@ -1,6 +1,7 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/q5/q5_shapes.h"
+#include "ops/linear/q5/q5_shapes_vision.h"
 #include <array>
 #include <stdexcept>
 
@@ -21,6 +22,11 @@ constexpr std::array kShapes{
     ShapeEntry{5120, 17408, select_q5_n5120_k17408, select_q5_n5120_k17408_unified},
     ShapeEntry{1152, 1152, select_q5_n1152_k1152, select_q5_n1152_k1152_unified},
     ShapeEntry{1152, 4304, select_q5_n1152_k4304, select_q5_n1152_k4304_unified},
+    // The 4B and 0.8B vision towers.
+    ShapeEntry{1024, 1024, select_q5_n1024_k1024},
+    ShapeEntry{1024, 4096, select_q5_n1024_k4096},
+    ShapeEntry{768, 768, select_q5_n768_k768},
+    ShapeEntry{768, 3072, select_q5_n768_k3072},
 };
 } // namespace
 

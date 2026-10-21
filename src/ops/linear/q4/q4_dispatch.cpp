@@ -1,6 +1,7 @@
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/q4/q4_shapes.h"
+#include "ops/linear/q4/q4_shapes_vision.h"
 #include <array>
 #include <stdexcept>
 
@@ -28,6 +29,12 @@ constexpr std::array kShapes{
     ShapeEntry{248320, 5120, select_q4_n248320_k5120},
     ShapeEntry{3456, 1152, select_q4_n3456_k1152, select_q4_n3456_k1152_unified},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152, select_q4_n4304_k1152_unified},
+    // The 4B and 0.8B vision towers: narrower than the 1152-wide tower those two were
+    // measured on, and no unified table of their own (one projection each, once per image).
+    ShapeEntry{3072, 1024, select_q4_n3072_k1024},
+    ShapeEntry{4096, 1024, select_q4_n4096_k1024},
+    ShapeEntry{2304, 768, select_q4_n2304_k768},
+    ShapeEntry{3072, 768, select_q4_n3072_k768},
 };
 } // namespace
 

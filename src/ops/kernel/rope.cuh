@@ -33,25 +33,46 @@ static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     2.738419634e-07F, 1.654817100e-07F,
 };
 
+// The 2-D vision table: a head is split into two axes, each with HeadDim/2 dimensions, so each
+// axis has HeadDim/4 rotary pairs at theta^(-2i/(HeadDim/2)) with theta = 10,000. The 72-wide
+// tower's table is the 18-value list below; a 64-wide tower's is the 16-value one beside it.
 static __device__ __constant__ float kVisionRopeInvFrequency[18] = {
     1.000000000e+00F, 5.994842503e-01F, 3.593813664e-01F, 2.154434690e-01F, 1.291549665e-01F,
     7.742636827e-02F, 4.641588834e-02F, 2.782559402e-02F, 1.668100537e-02F, 1.000000000e-02F,
     5.994842503e-03F, 3.593813664e-03F, 2.154434690e-03F, 1.291549665e-03F, 7.742636827e-04F,
     4.641588834e-04F, 2.782559402e-04F, 1.668100537e-04F,
 };
+static __device__ __constant__ float kVisionRopeInvFrequency64[16] = {
+    1.000000000e+00F, 5.623413252e-01F, 3.162277660e-01F, 1.778279410e-01F, 1.000000000e-01F,
+    5.623413252e-02F, 3.162277660e-02F, 1.778279410e-02F, 1.000000000e-02F, 5.623413252e-03F,
+    3.162277660e-03F, 1.778279410e-03F, 1.000000000e-03F, 5.623413252e-04F, 3.162277660e-04F,
+    1.778279410e-04F,
+};
 
-template <RopeKernelMode Mode>
+// Pairs per axis of the 2-D vision table: a head is two axes of HeadDim/2 dimensions each, so
+// HeadDim/4 rotary pairs per axis. VisionPairsAxis<72> is 18, the width the 27B and 9B towers use.
+template <int HeadDim>
+inline constexpr int kVisionPairsAxis = HeadDim / 4;
+
+template <int PairsAxis>
+__device__ __forceinline__ float vision_axis_frequency(int pair) {
+    return PairsAxis == 18 ? kVisionRopeInvFrequency[pair]
+                           : kVisionRopeInvFrequency64[pair];
+}
+
+template <RopeKernelMode Mode, int HeadDim = 72>
 __device__ __forceinline__ void fixed_axis_frequency(int pair, int* axis, float* frequency) {
     if constexpr (Mode == RopeKernelMode::Vision2D) {
-        *axis      = pair / 18;
-        *frequency = kVisionRopeInvFrequency[pair % 18];
+        constexpr int PairsAxis = kVisionPairsAxis<HeadDim>;
+        *axis                   = pair / PairsAxis;
+        *frequency              = vision_axis_frequency<PairsAxis>(pair % PairsAxis);
     } else {
         *axis      = Mode == RopeKernelMode::TextMrope ? pair % 3 : 0;
         *frequency = kTextRopeInvFrequency[pair];
     }
 }
 
-template <RopeKernelMode Mode>
+template <RopeKernelMode Mode, int HeadDim = 72>
 __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int tokens, int token,
                                              int pair, float* sine, float* cosine) {
     if constexpr (Mode == RopeKernelMode::DflashText1D) {
@@ -59,7 +80,7 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
     } else {
         int axis = 0;
         float frequency;
-        fixed_axis_frequency<Mode>(pair, &axis, &frequency);
+        fixed_axis_frequency<Mode, HeadDim>(pair, &axis, &frequency);
         const float angle =
             static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
             frequency;
@@ -110,14 +131,16 @@ apply_rope_token(__nv_bfloat16* q, __nv_bfloat16* k, int token, std::int64_t q_t
     }
 }
 
-template <RopeKernelMode Mode, int QHeads, int KHeads>
+// VisionHeadDim is the 2-D vision head width (72 on the 1152-wide tower, 64 on the 1024- and
+// 768-wide ones); every other mode derives its own and ignores it.
+template <RopeKernelMode Mode, int QHeads, int KHeads, int VisionHeadDim = 72>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride) {
-    constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
+    constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? VisionHeadDim
                              : Mode == RopeKernelMode::DflashText1D ? 128
                                                                     : 256;
-    constexpr int kHalf    = Mode == RopeKernelMode::Vision2D       ? 36
+    constexpr int kHalf    = Mode == RopeKernelMode::Vision2D       ? VisionHeadDim / 2
                              : Mode == RopeKernelMode::DflashText1D ? 64
                                                                     : 32;
     const int token        = static_cast<int>(blockIdx.x);
@@ -127,7 +150,8 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     __shared__ float sin_cache[kHalf];
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
-        fixed_sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        fixed_sincos<Mode, VisionHeadDim>(positions, tokens, token, pair, &sin_cache[pair],
+                                          &cos_cache[pair]);
     }
     __syncthreads();
     apply_rope_token<kHeadDim, kHalf, QHeads, KHeads>(q, k, token, q_token_stride, k_token_stride,

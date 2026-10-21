@@ -2,6 +2,7 @@
 
 #include "ops/launcher/rope.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -12,7 +13,9 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kTextHeadDim = 256;
-constexpr std::int32_t kVisionDim   = 72;
+// The 2-D vision tower's head width, per tower geometry: 1152/16 = 72 on the 27B and 9B, and
+// 1024/16 = 768/12 = 64 on the 4B and 0.8B. Two axes of HeadDim/2 dimensions each.
+constexpr std::int32_t kVisionDims[] = {72, 64};
 
 std::int64_t numel_allow_zero(const Tensor& tensor, const char* label) {
     bool zero      = false;
@@ -82,8 +85,11 @@ void require_positions_storage(const Tensor& positions) {
 
 void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
     if (axes == 2) {
-        if (head_dim != kVisionDim || rotary_dim != kVisionDim) {
-            throw std::invalid_argument("rope: 2-D Vision mode requires head_dim=rotary_dim=72");
+        if (head_dim != rotary_dim || std::find(std::begin(kVisionDims), std::end(kVisionDims),
+                                                head_dim) == std::end(kVisionDims)) {
+            throw std::invalid_argument(
+                "rope: 2-D Vision mode requires head_dim = rotary_dim = 72 (1152-wide tower) or "
+                "64 (1024- and 768-wide towers)");
         }
         return;
     }
@@ -131,7 +137,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
     (void)numel_allow_zero(k, "k");
     const std::int32_t tokens   = q.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : q.ne[0];
+    const std::int32_t head_dim = q.ne[0];
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t k_heads  = k.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
@@ -154,7 +160,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
     const std::int32_t tokens   = x.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : x.ne[0];
+    const std::int32_t head_dim = x.ne[0];
     const std::int32_t heads    = x.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
     require_yarn(yarn, axes, rotary_dim, head_dim);
