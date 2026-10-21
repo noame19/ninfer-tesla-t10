@@ -433,7 +433,9 @@ int main(int argc, char** argv) {
                 .models_max  = options.models_max,
                 .autoload    = options.models_autoload,
                 .sleep_idle  = std::chrono::seconds(options.sleep_idle_seconds),
-                .unload_idle = std::chrono::seconds(options.unload_idle_seconds)},
+                .unload_idle = std::chrono::seconds(options.unload_idle_seconds),
+                // Only router mode has more than one model to weigh against the card.
+                .enforce_device_room = options.router()},
             [&](const ninfer::serve::ModelDefinition& definition)
                 -> std::unique_ptr<ninfer::serve::ModelService> {
                 if (first) {

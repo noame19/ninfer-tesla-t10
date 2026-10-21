@@ -1,6 +1,11 @@
 #include "serve/model_registry.h"
 
+#include "artifact/reader.h"
+
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -198,6 +203,65 @@ bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::si
     }
 }
 
+std::optional<std::uint64_t> ModelRegistry::device_free_bytes() {
+    std::size_t free_bytes = 0;
+    std::size_t total      = 0;
+    if (cudaMemGetInfo(&free_bytes, &total) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(free_bytes);
+}
+
+std::optional<std::uint64_t> ModelRegistry::model_device_bytes(const ModelDefinition& model) {
+    // The artifact's stored payload plus the per-stage and head budgets the load planner reserves
+    // on top of it (models/qwen3_5/load.cpp:141-143): the same figures that decide whether a load
+    // fits there, so a requirement that fits in the planner fits here.
+    constexpr std::uint64_t kStageFixedBytes     = 1536ULL << 20;
+    constexpr std::uint64_t kHeadStageFixedBytes = 1024ULL << 20;
+    try {
+        const artifact::Reader reader(model.options.artifact_path);
+        return reader.directory().payload_bytes + kStageFixedBytes + kHeadStageFixedBytes;
+    } catch (const std::exception&) { return std::nullopt; }
+}
+
+bool ModelRegistry::device_has_room_locked(std::size_t index, std::string* why) const {
+    if (!policy_.enforce_device_room) { return true; }
+    const std::optional<std::uint64_t> free_bytes = device_free_bytes();
+    if (!free_bytes) { return true; }
+    const std::optional<std::uint64_t> needed = model_device_bytes(models_[index].definition);
+    if (!needed) { return true; }
+    if (*needed <= *free_bytes) { return true; }
+    if (why != nullptr) {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "'%s' needs %llu MiB on the device and %llu MiB is free",
+                      models_[index].definition.id.c_str(),
+                      static_cast<unsigned long long>((*needed + (1ULL << 20) - 1) >> 20),
+                      static_cast<unsigned long long>(*free_bytes >> 20));
+        *why = line;
+    }
+    return false;
+}
+
+bool ModelRegistry::evict_idle_locked(std::unique_lock<std::mutex>& lock, std::size_t keep) {
+    std::optional<std::size_t> victim;
+    for (std::size_t index = 0; index < models_.size(); ++index) {
+        const Slot& slot = models_[index];
+        if (index == keep || slot.state != ModelState::Loaded || slot.leases != 0) { continue; }
+        if (!victim || slot.last_used < models_[*victim].last_used) { victim = index; }
+    }
+    if (!victim) { return false; }
+    // A suspended model keeps its host caches and gives the device memory back, so it is the
+    // cheaper eviction where it is available; otherwise the Engine goes.
+    if (models_[*victim].service->suspendable()) {
+        put_to_sleep_locked(lock, *victim);
+    } else {
+        unload_locked(lock, *victim);
+    }
+    return true;
+}
+
 void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index) {
     const Clock::time_point deadline = Clock::now() + policy_.room_timeout;
     for (;;) {
@@ -214,6 +278,22 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
         if (!make_room_locked(lock, index, deadline)) {
             throw ModelLoadFailed("no room to load model '" + slot.definition.id +
                                   "': every loaded model is busy");
+        }
+        // `models_max` says how many models may be loaded; it does not say they fit together. Ask
+        // the device before building the Engine: an allocation failure inside it arrives as a bare
+        // cudaErrorMemoryAllocation from whichever buffer happened to be first, and the request that
+        // asked for the model cannot tell a full card from a broken artifact. Keep giving back
+        // idle models while any are left -- `models_max` is not the binding constraint here, memory
+        // is -- and report the shortfall only when nothing else can be released.
+        {
+            std::string shortfall;
+            while (!device_has_room_locked(index, &shortfall)) {
+                if (!evict_idle_locked(lock, index)) {
+                    throw ModelLoadFailed("no room for model " + shortfall +
+                                          ", and every other loaded model is busy so nothing "
+                                          "more can be released");
+                }
+            }
         }
         if (slot.state != ModelState::Unloaded && slot.state != ModelState::Sleeping) { continue; }
         slot.state = ModelState::Loading;

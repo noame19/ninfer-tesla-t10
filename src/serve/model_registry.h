@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -71,6 +72,14 @@ struct RegistryPolicy {
     std::chrono::seconds unload_idle{0};
     // How long a request waits for a busy model to make room before it fails.
     std::chrono::seconds room_timeout{600};
+
+    // `models_max` bounds how many models are loaded at once; on one card that is not the same
+    // bound as how much they fit together. With this set, a load whose requirement exceeds the
+    // device's free memory is refused before its Engine is built -- with the two figures in the
+    // message, and after releasing every idle model -- instead of surfacing as a bare allocation
+    // error from whichever buffer happened to be first. Router mode only: one model loads whatever
+    // the card says, as it always has.
+    bool enforce_device_room = false;
 };
 
 // A service the registry starts for a model, and how it is driven. Production builds a
@@ -218,6 +227,15 @@ private:
     // Frees one loaded slot other than `keep`, waiting for one to become idle; false on timeout.
     bool make_room_locked(std::unique_lock<std::mutex>& lock, std::size_t keep,
                           std::chrono::steady_clock::time_point deadline);
+    // Frees one loaded slot other than `keep` that has no leases, without waiting: the device has
+    // no room for the model being loaded, so `models_max` is not the binding constraint and a busy
+    // model is the only reason to stop. False when every other loaded model is in use.
+    bool evict_idle_locked(std::unique_lock<std::mutex>& lock, std::size_t keep);
+    // Whether the device has room for `index`; when it does not, `why` receives the reason.
+    [[nodiscard]] bool device_has_room_locked(std::size_t index, std::string* why) const;
+    // The device's free memory, and what a model needs of it.
+    [[nodiscard]] static std::optional<std::uint64_t> device_free_bytes();
+    [[nodiscard]] static std::optional<std::uint64_t> model_device_bytes(const ModelDefinition& model);
     void put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void unload_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void publish_locked(std::size_t index);
