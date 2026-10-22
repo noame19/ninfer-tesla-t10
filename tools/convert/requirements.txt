@@ -1,0 +1,7 @@
+# The converter's own dependencies. torch and numpy do the block work; safetensors supplies the
+# base checkpoint's config and frontend resources (a GGUF-only conversion still needs them);
+# gguf is the maintained block reader tools/convert/sources/gguf_source.py dequantizes with.
+torch>=2.6
+numpy>=2.0
+safetensors>=0.4
+gguf>=0.19
